@@ -237,13 +237,17 @@ def main():
             cycle_started = time.monotonic()
             config = read_config() # edits take effect without a restart
             tracked_fans.update(config['required_fans'])
+            sensor_started = time.monotonic()
             try:
                 sensors = read_sensors()
             except (subprocess.TimeoutExpired, RuntimeError) as error:
                 sensors = {}
+                sensor_timestamp = None
                 read_error = str(error)
             else:
+                sensor_timestamp = time.time()
                 read_error = None
+            sensor_duration = time.monotonic() - sensor_started
             # Remember any additional fans/DIMMs reconnected during this run.
             tracked_fans.update(n for n,s in sensors.items() if n.startswith('SYS_FAN') and (s['value'] or 0)>0)
             tracked_temps.update(n for n,s in sensors.items() if n.startswith('Temp_DIMM_') and s['value'] is not None)
@@ -261,7 +265,9 @@ def main():
             if config.get('cpu_control_mode', 'curve') != 'adaptive':
                 target = cooldown(target, previous, config['fall_percent_per_cycle'])
             effective = manual(target); previous = target
-            status = {'timestamp':time.time(),'duty_percent':effective,'target_percent':round(target,1),
+            status = {'timestamp':time.time(),'ipmi_read_timestamp_seconds':sensor_timestamp,
+                      'ipmi_read_duration_seconds':sensor_duration,'ipmi_sensors':sensors,
+                      'duty_percent':effective,'target_percent':round(target,1),
                       'demand_percent':round(demand_percent,1),
                       'cycle_work_seconds':round(time.monotonic()-cycle_started,3),
                       'cpu_control_mode':config.get('cpu_control_mode', 'curve'),
@@ -274,6 +280,13 @@ def main():
                       'cpu_only':config.get('cpu_only', False),
                       'curve_mode':config.get('curve_mode','linear')}
             temporary = pathlib.Path(STATE + '.tmp'); temporary.write_text(json.dumps(status,indent=2)); temporary.replace(STATE)
+            exporter = '/usr/local/sbin/ipmi-metrics-5s.py'
+            if pathlib.Path(exporter).is_file():
+                try:
+                    subprocess.run([exporter], check=True, timeout=2,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except (OSError, subprocess.SubprocessError):
+                    print('Monitoring export failed; fan control continues', flush=True)
             event = (round(effective),tuple(reasons))
             if event != last_event or time.monotonic()-last_log>60:
                 print('duty=%s%% cpu=%sC faults=%s' % (effective,max(core_max,temperatures.get('CPU0 Temp',0),temperatures.get('CPU1 Temp',0)),reasons),flush=True)
