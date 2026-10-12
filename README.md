@@ -162,7 +162,12 @@ run `systemctl daemon-reload`, and enable/start the restored service.
 On verified S210 firmware 7.54, selector 1 of `0x30 0xf9` was tested on
 quanta2: `[0x01, 0x10]` raised only `SYS_FAN1-1` and `SYS_FAN1-2` from about
 4200/2900 RPM to 5400/3800 RPM. Other modules remained near baseline.
-This establishes module-1 selection, not whether zero duty stops its rotors.
+This establishes module-1 selection. A subsequent guarded zero-duty test on
+quanta2 accepted `[0x01, 0x00]`, but neither rotor stopped: after about seven
+seconds they settled near 4200/2900 RPM. Setting raw duty 16 again raised them
+to 5400/3800 RPM. CPU temperatures remained 38-42 C. Zero duty therefore does
+not provide a fan-stop function through this interface on the tested system;
+the test does not distinguish a BMC clamp from the fans' internal minimum.
 
 `python3 scripts/test-fan-mapping.py` repeats this increased-airflow-only test
 with health guards and an independent 90-second systemd restore timer. It
@@ -171,6 +176,13 @@ are written to `/root/quanta-firmware-research/fan1-mapping-test.json`; create
 that directory before running. The test requires the normal controller to be
 active and refuses to proceed when CPU temperatures reach 55 C or fans report
 faults. It must not be run concurrently with another manual fan test.
+
+`python3 scripts/test-fan-mapping.py --stop-fan1` explicitly enables the brief
+zero-duty experiment: all other fans are kept at raw duty 16, only fan 1 may
+report low-speed alarms during the zero phase, temperature increases above
+five degrees abort the test, and nonzero fan-1 operation is checked afterward.
+Results are saved separately as `fan1-zero-duty-test.json`. This option is
+experimental and does not configure a permanent idle-stop policy.
 
 These tests mock hardware access and require only Python's standard library:
 
