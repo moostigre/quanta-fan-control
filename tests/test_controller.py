@@ -186,6 +186,40 @@ class ControllerTests(unittest.TestCase):
         with patch.object(controller.time, 'monotonic', return_value=13):
             self.assertEqual(controller.remaining_delay(10, 1), 0)
 
+    def test_adaptive_holds_stable_airflow_in_target_band(self):
+        adaptive = controller.AdaptiveCPU(59, 0)
+        self.assertEqual(adaptive.update(self.config, 59, 20, 3), 20)
+        self.assertEqual(adaptive.update(self.config, 59, 20, 6), 20)
+
+    def test_adaptive_ramps_on_warming_before_target(self):
+        adaptive = controller.AdaptiveCPU(57, 0)
+        requested = adaptive.update(self.config, 59, 10, 2)
+        self.assertGreater(adaptive.predicted, 60)
+        self.assertGreater(requested, 10)
+        self.assertLessEqual(requested, 20)
+
+    def test_adaptive_cools_gradually_and_obeys_full_speed_limit(self):
+        adaptive = controller.AdaptiveCPU(55, 0)
+        self.assertEqual(adaptive.update(self.config, 55, 20, 2), 18)
+        self.assertEqual(adaptive.update(self.config, 55, 1, 4), 1)
+        self.assertEqual(adaptive.update(self.config, 65, 20, 6), 100)
+
+    def test_adaptive_increases_when_temperature_is_above_target_even_if_stable(self):
+        adaptive = controller.AdaptiveCPU(61, 0)
+        self.assertGreater(adaptive.update(self.config, 61, 20, 2), 20)
+
+    def test_adaptive_configuration_rejects_invalid_targets_and_multisensor_mode(self):
+        self.raw['cpu_control_mode'] = 'adaptive'
+        for value in [False, 39, 61, float('nan')]:
+            self.raw['cpu_target_c'] = value
+            with self.assertRaises(ValueError):
+                controller.validate_config(self.raw)
+        self.raw['cpu_target_c'] = 60
+        self.assertEqual(controller.validate_config(self.raw)['cpu_target_c'], 60)
+        self.raw['cpu_only'] = False
+        with self.assertRaisesRegex(ValueError, 'cpu_only'):
+            controller.validate_config(self.raw)
+
     def test_exception_after_entering_manual_mode_restores_automatic(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(controller, 'read_config', return_value=self.config), \

@@ -76,6 +76,25 @@ non-empty curve, in CPU/DIMM/PCH/ambient/backplane/inlet/exhaust order. Set
 highest demand wins. Temperature and fan health checks remain active in
 CPU-only mode.
 
+### Adaptive CPU temperature control
+
+Set `cpu_control_mode` to `"adaptive"` and `cpu_target_c` to `60` with
+`cpu_only: true` to replace normal curve steps with temperature feedback.
+The controller uses the hottest core or BMC CPU reading. It filters the
+temperature trend over roughly ten seconds and projects warming ten seconds
+ahead. Predicted temperatures above the target progressively increase the
+requested duty, capped at five percentage points per second. Stable readings
+in the 58-60 C band hold duty. Below 58 C, when not appreciably warming, duty
+falls gradually and remains subject to `fall_percent_per_cycle`.
+
+The first CPU curve duty is the minimum airflow; its final temperature still
+forces 100% immediately. Sensor faults and the hardware critical margin also
+override feedback with full speed. A 60 C target is not a guaranteed ceiling:
+sudden load changes, slow BMC reads, and fan response can cause brief overshoot.
+Observe behavior under representative load before relying on these defaults.
+Status reports `cpu_trend_c_per_second` and `cpu_predicted_c`. Omit
+`cpu_control_mode`, or set it to `"curve"`, to use the original step/linear mode.
+
 Missing/invalid temperatures, sensor alarms, fan faults, or CPU temperatures
 within 10°C of the hardware critical threshold request 100% duty. Startup health
 faults refuse activation. Runtime IPMI sensor-read errors request full speed

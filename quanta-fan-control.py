@@ -76,6 +76,16 @@ def validate_config(c):
         raise ValueError('cpu_only must be true or false')
     if resolved.get('curve_mode', 'linear') not in ('linear', 'step'):
         raise ValueError('curve_mode must be linear or step')
+    if resolved.get('cpu_control_mode', 'curve') not in ('curve', 'adaptive'):
+        raise ValueError('cpu_control_mode must be curve or adaptive')
+    if resolved.get('cpu_control_mode') == 'adaptive':
+        if not resolved.get('cpu_only', False):
+            raise ValueError('Adaptive CPU control requires cpu_only=true')
+        target = resolved.get('cpu_target_c', 60)
+        if (isinstance(target, bool) or not isinstance(target, (int, float))
+                or not math.isfinite(target) or not 40 <= target <= 60
+                or target > resolved['cpu_curve'][-1][0] - 3):
+            raise ValueError('cpu_target_c must be 40-60 C and at least 3 C below full speed')
     if not resolved['required_fans']: raise ValueError('Required fans must be specified')
     if not 1 <= resolved['interval_seconds'] <= 5: raise ValueError('Interval must be 1–5 seconds')
     if not 1 <= resolved['fall_percent_per_cycle'] <= 5: raise ValueError('Fall limit must be 1–5%')
@@ -165,6 +175,31 @@ def cooldown(target, previous, fall):
 def remaining_delay(started, interval):
     return max(0, started + interval - time.monotonic())
 
+class AdaptiveCPU:
+    """Hold airflow in the target band; react to a filtered warming trend."""
+    def __init__(self, temperature, now):
+        self.temperature, self.sample_time = temperature, now
+        self.rate = 0.0
+        self.predicted = temperature
+
+    def update(self, config, temperature, previous, now):
+        elapsed = max(.001, now - self.sample_time)
+        measured_rate = (temperature - self.temperature) / elapsed
+        weight = elapsed / (10 + elapsed)
+        self.rate += weight * (measured_rate - self.rate)
+        self.temperature, self.sample_time = temperature, now
+        self.predicted = temperature + max(0, self.rate) * 10
+        target = config.get('cpu_target_c', 60)
+        minimum = config['cpu_curve'][0][1]
+        if temperature >= config['cpu_curve'][-1][0]:
+            return 100
+        error = self.predicted - target
+        if error > 0:
+            return min(100, max(minimum, previous + min(5, 4 * error) * elapsed))
+        if temperature < target - 2 and self.rate <= .02:
+            return max(minimum, previous - elapsed)
+        return max(minimum, previous)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--check', action='store_true', help='validate and report without changing fan control')
@@ -188,6 +223,8 @@ def main():
     signal.signal(signal.SIGTERM,on_signal); signal.signal(signal.SIGINT,on_signal)
     pathlib.Path(STATE).parent.mkdir(parents=True,exist_ok=True)
     previous, last_log, last_event = target, 0, None
+    adaptive = AdaptiveCPU(max(core_max, temperatures['CPU0 Temp'], temperatures['CPU1 Temp']),
+                           time.monotonic())
     try:
         notify('READY=1')
         while not stop:
@@ -208,6 +245,11 @@ def main():
             target,reasons,temperatures = demand(config,sensors,core_max,core_critical,tracked_fans,tracked_temps)
             if read_error:
                 reasons.append('sensor read failed: ' + read_error)
+            cpu_max = max(core_max, temperatures.get('CPU0 Temp', 0), temperatures.get('CPU1 Temp', 0))
+            if config.get('cpu_control_mode', 'curve') == 'adaptive' and not reasons:
+                target = adaptive.update(config, cpu_max, previous, time.monotonic())
+            else:
+                adaptive = AdaptiveCPU(cpu_max, time.monotonic())
             demand_percent = target
             # Never delay rising speed; let falling speed settle gradually.
             target = cooldown(target, previous, config['fall_percent_per_cycle'])
@@ -215,6 +257,10 @@ def main():
             status = {'timestamp':time.time(),'duty_percent':effective,'target_percent':round(target,1),
                       'demand_percent':round(demand_percent,1),
                       'cycle_work_seconds':round(time.monotonic()-cycle_started,3),
+                      'cpu_control_mode':config.get('cpu_control_mode', 'curve'),
+                      'cpu_target_c':config.get('cpu_target_c', 60),
+                      'cpu_trend_c_per_second':round(adaptive.rate,4),
+                      'cpu_predicted_c':round(adaptive.predicted,2),
                       'cpu_core_max_c':core_max,'temperatures_c':temperatures,'faults':reasons,
                       'rpm':{n:sensors.get(n,{}).get('value') for n in sorted(tracked_fans)},
                       'curve_sources':config['curve_sources'],
