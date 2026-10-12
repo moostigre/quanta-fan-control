@@ -157,6 +157,21 @@ run `systemctl daemon-reload`, and enable/start the restored service.
 
 ## Validation
 
+### Individual fan mapping test
+
+On verified S210 firmware 7.54, selector 1 of `0x30 0xf9` was tested on
+quanta2: `[0x01, 0x10]` raised only `SYS_FAN1-1` and `SYS_FAN1-2` from about
+4200/2900 RPM to 5400/3800 RPM. Other modules remained near baseline.
+This establishes module-1 selection, not whether zero duty stops its rotors.
+
+`python3 scripts/test-fan-mapping.py` repeats this increased-airflow-only test
+with health guards and an independent 90-second systemd restore timer. It
+temporarily stops the normal controller and restores it on completion. Results
+are written to `/root/quanta-firmware-research/fan1-mapping-test.json`; create
+that directory before running. The test requires the normal controller to be
+active and refuses to proceed when CPU temperatures reach 55 C or fans report
+faults. It must not be run concurrently with another manual fan test.
+
 These tests mock hardware access and require only Python's standard library:
 
 ```bash
