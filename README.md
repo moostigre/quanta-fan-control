@@ -1,8 +1,10 @@
 # Quanta S210 fan control
 
 Temperature-based fan control exported from **quanta1**, packaged for installation
-on **quanta2**. The controller, configuration, and systemd unit are the original
-files exported on 12 October 2026; the installer and tests are added here.
+on **quanta2**. Based on the files exported on 12 October 2026, with reusable
+configuration, installation scripts, and tests. The original quanta1 configuration
+snapshot and systemd unit are retained; the controller permits requested duties
+down to 1% and RPM floors down to 100.
 
 The controller uses local `ipmitool` commands on the physical Proxmox host.
 Its hardware check requires S210-X12RS BMC firmware **7.54**, manufacturer ID
@@ -30,7 +32,8 @@ Existing systemd drop-ins are backed up and retained.
 
 The earlier quanta2 exporter reported zero RPM on its fan channels. The installer
 checks live BMC readings and refuses activation if a required fan is missing,
-below 500 RPM, or reports an alarm. Resolve the sensor/fan readings before retrying.
+below the configured minimum (100 RPM in the base configuration), or reports an
+alarm. Resolve the sensor/fan readings before retrying.
 The snapshot has been validated locally; installation on quanta2 has not yet
 been performed.
 
@@ -43,22 +46,26 @@ are preserved. `config/quanta-fan-control.json` retains the original quanta1
 snapshot. To install a tuned copy of the base, use `--config /path/to/config.json`.
 
 Edit `/etc/quanta-fan-control.json`. Valid edits are read each cycle without a
-restart. The exported configuration uses CPU-only, step-based control:
+restart. The base configuration uses CPU-only, step-based control:
 
 | CPU temperature | Requested fan duty |
 | --- | --- |
-| Below 50°C | 5% |
+| Below 50°C | 1% |
 | 50°C to below 60°C | 10% |
 | 60°C to below 65°C | 20% |
 | 65°C and above | 100% |
 
-Actual duty is rounded upward to the BMC's 1–63 scale. RPM is measured separately
+Actual duty is rounded upward to the controller's BMC 1–63 scale: a 1% request
+uses raw level 1 and is reported as **1.6% effective duty**. RPM is measured separately
 and is not a direct percentage of maximum RPM. Falling duty is limited to three
 percentage points per cycle; rising duty is applied immediately. Each cycle
 includes sensor reads and IPMI commands, then the configured two-second delay.
 
 Curve points are `[temperature, duty_percent]`. Temperatures must increase,
-duty must not decrease, and each non-empty curve must end at **100%**. The CPU
+duty must remain within **1–100%** and must not decrease, and each non-empty curve
+must end at **100%**. `minimum_rpm` accepts **100–5000 RPM** and defaults to 100 in
+the base configuration. Existing installations keep their selected configuration.
+The CPU
 full-speed temperature must be at most **68°C**. Empty curves inherit the first
 non-empty curve, in CPU/DIMM/PCH/ambient/backplane/inlet/exhaust order. Set
 `cpu_only` to `false` to include all curves in normal demand selection; the

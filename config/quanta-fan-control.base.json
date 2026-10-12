@@ -1,5 +1,5 @@
 {
-  "cpu_curve": [[0, 5], [45, 5], [50, 10], [60, 20], [65, 100]],
+  "cpu_curve": [[0, 1], [45, 1], [50, 10], [60, 20], [65, 100]],
   "dimm_curve": [],
   "pch_curve": [],
   "ambient_curve": [],
@@ -7,7 +7,7 @@
   "inlet_curve": [],
   "exhaust_curve": [],
   "required_fans": ["SYS_FAN1-1", "SYS_FAN1-2", "SYS_FAN2-1", "SYS_FAN2-2", "SYS_FAN3-1", "SYS_FAN3-2", "SYS_FAN4-1", "SYS_FAN4-2", "SYS_FAN5-1", "SYS_FAN5-2", "SYS_FAN6-1", "SYS_FAN6-2"],
-  "minimum_rpm": 500,
+  "minimum_rpm": 100,
   "interval_seconds": 2,
   "fall_percent_per_cycle": 3,
   "cpu_only": true,

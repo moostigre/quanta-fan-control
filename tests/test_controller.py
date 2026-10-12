@@ -53,7 +53,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_malformed_and_nonfinite_curves_are_rejected(self):
         for points in [[], [[0, 5]], [[0, 5], [0, 100]], [[0, 20], [60, 10], [65, 100]],
-                       [[0, 4], [65, 100]], [[0, 5], [float('nan'), 100]], [[False, 5], [65, 100]]]:
+                       [[0, 0.99], [65, 100]], [[0, 5], [float('nan'), 100]], [[False, 5], [65, 100]]]:
             with self.subTest(points=points):
                 config = copy.deepcopy(self.raw)
                 config['cpu_curve'] = points
@@ -61,7 +61,7 @@ class ControllerTests(unittest.TestCase):
                     controller.validate_config(config)
 
     def test_step_threshold_boundaries(self):
-        for temperature, expected in [(0, 5), (49.9, 5), (50, 10), (59.9, 10), (60, 20), (64.9, 20), (65, 100), (80, 100)]:
+        for temperature, expected in [(0, 1), (49.9, 1), (50, 10), (59.9, 10), (60, 20), (64.9, 20), (65, 100), (80, 100)]:
             with self.subTest(temperature=temperature):
                 self.assertEqual(controller.interpolate(self.config['cpu_curve'], temperature, 'step'), expected)
 
@@ -91,6 +91,26 @@ class ControllerTests(unittest.TestCase):
         target, faults, _ = self.demand()
         self.assertEqual(target, 100)
         self.assertIn('fan failure: SYS_FAN1-1', faults)
+
+    def test_new_base_allows_one_percent_and_100_rpm(self):
+        self.assertEqual(self.config['cpu_curve'][0][1], 1)
+        self.assertEqual(self.config['minimum_rpm'], 100)
+        for fan in self.fans:
+            self.sensors[fan]['value'] = 100
+        target, faults, _ = self.demand(core=40)
+        self.assertEqual(target, 1)
+        self.assertEqual(faults, [])
+
+    def test_fan_below_100_rpm_still_requests_full_speed(self):
+        self.sensors['SYS_FAN1-1']['value'] = 99
+        target, faults, _ = self.demand()
+        self.assertEqual(target, 100)
+        self.assertIn('fan failure: SYS_FAN1-1', faults)
+
+    def test_rpm_floor_below_100_is_rejected(self):
+        self.raw['minimum_rpm'] = 99
+        with self.assertRaisesRegex(ValueError, '100–5000'):
+            controller.validate_config(self.raw)
 
     def test_hardware_critical_margin_requests_full_speed(self):
         self.assertEqual(self.demand(core=90, critical=100)[0], 100)
@@ -140,6 +160,11 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(controller.manual(5), 6.3)
             self.assertEqual(command.call_args_list[0].args, ('raw', '0x30', '0xf9', '0xff', '0x00'))
             self.assertEqual(command.call_args_list[1].args, ('raw', '0x30', '0xf9', '0x00', '0x4'))
+
+    def test_one_percent_uses_lowest_nonzero_bmc_level(self):
+        with patch.object(controller, 'command') as command:
+            self.assertEqual(controller.manual(1), 1.6)
+            self.assertEqual(command.call_args_list[1].args, ('raw', '0x30', '0xf9', '0x00', '0x1'))
 
     def test_exception_after_entering_manual_mode_restores_automatic(self):
         with tempfile.TemporaryDirectory() as directory:

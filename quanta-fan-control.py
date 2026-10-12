@@ -39,7 +39,7 @@ def manual(percent):
 
 CURVE_KEYS = ('cpu_curve', 'dimm_curve', 'pch_curve', 'ambient_curve',
               'backplane_curve', 'inlet_curve', 'exhaust_curve')
-MINIMUM_DUTY_PERCENT = 5
+MINIMUM_DUTY_PERCENT = 1
 
 def validate_config(c):
     """Resolve empty curves in memory; keep the editable file unchanged."""
@@ -62,7 +62,7 @@ def validate_config(c):
                 raise ValueError(key + ': temperatures and duties must be finite numbers')
             if not (temperature > previous[0] and MINIMUM_DUTY_PERCENT <= duty <= 100
                     and duty >= previous[1]):
-                raise ValueError(key + ': increasing temperatures and 5–100% duties required')
+                raise ValueError(key + ': increasing temperatures and 1–100% duties required')
             previous = (temperature, duty)
         if points[-1][1] != 100: raise ValueError(key + ': final point must be 100%')
         if first is None: first, first_key = points, key
@@ -79,7 +79,7 @@ def validate_config(c):
     if not resolved['required_fans']: raise ValueError('Required fans must be specified')
     if not 1 <= resolved['interval_seconds'] <= 5: raise ValueError('Interval must be 1–5 seconds')
     if not 1 <= resolved['fall_percent_per_cycle'] <= 5: raise ValueError('Fall limit must be 1–5%')
-    if not 500 <= resolved['minimum_rpm'] <= 5000: raise ValueError('Minimum RPM must be 500–5000')
+    if not 100 <= resolved['minimum_rpm'] <= 5000: raise ValueError('Minimum RPM must be 100–5000')
     return resolved
 
 def read_config():
