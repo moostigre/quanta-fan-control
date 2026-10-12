@@ -159,6 +159,12 @@ def on_signal(signum, frame):
     global stop
     stop = True
 
+def cooldown(target, previous, fall):
+    return max(target, previous - fall)
+
+def remaining_delay(started, interval):
+    return max(0, started + interval - time.monotonic())
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--check', action='store_true', help='validate and report without changing fan control')
@@ -185,18 +191,30 @@ def main():
     try:
         notify('READY=1')
         while not stop:
+            cycle_started = time.monotonic()
             config = read_config() # edits take effect without a restart
             tracked_fans.update(config['required_fans'])
-            sensors = read_sensors()
+            try:
+                sensors = read_sensors()
+            except (subprocess.TimeoutExpired, RuntimeError) as error:
+                sensors = {}
+                read_error = str(error)
+            else:
+                read_error = None
             # Remember any additional fans/DIMMs reconnected during this run.
             tracked_fans.update(n for n,s in sensors.items() if n.startswith('SYS_FAN') and (s['value'] or 0)>0)
             tracked_temps.update(n for n,s in sensors.items() if n.startswith('Temp_DIMM_') and s['value'] is not None)
             core_max, core_critical = core_temperatures()
             target,reasons,temperatures = demand(config,sensors,core_max,core_critical,tracked_fans,tracked_temps)
+            if read_error:
+                reasons.append('sensor read failed: ' + read_error)
+            demand_percent = target
             # Never delay rising speed; let falling speed settle gradually.
-            target = max(target, previous-config['fall_percent_per_cycle'])
-            effective = manual(target); previous = effective
+            target = cooldown(target, previous, config['fall_percent_per_cycle'])
+            effective = manual(target); previous = target
             status = {'timestamp':time.time(),'duty_percent':effective,'target_percent':round(target,1),
+                      'demand_percent':round(demand_percent,1),
+                      'cycle_work_seconds':round(time.monotonic()-cycle_started,3),
                       'cpu_core_max_c':core_max,'temperatures_c':temperatures,'faults':reasons,
                       'rpm':{n:sensors.get(n,{}).get('value') for n in sorted(tracked_fans)},
                       'curve_sources':config['curve_sources'],
@@ -208,7 +226,7 @@ def main():
                 print('duty=%s%% cpu=%sC faults=%s' % (effective,max(core_max,temperatures.get('CPU0 Temp',0),temperatures.get('CPU1 Temp',0)),reasons),flush=True)
                 last_log = time.monotonic(); last_event = event
             notify('WATCHDOG=1\nSTATUS=Fan duty %s%%; CPU %s C' % (effective,core_max))
-            end = time.monotonic()+config['interval_seconds']
+            end = time.monotonic()+remaining_delay(cycle_started, config['interval_seconds'])
             while not stop and time.monotonic()<end: time.sleep(.2)
     except Exception:
         if not stop:

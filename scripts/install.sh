@@ -64,7 +64,9 @@ install -m 0644 "$selected_config" /etc/quanta-fan-control.json
 install -m 0644 "$repo_dir/systemd/quanta-fan-control.service" /etc/systemd/system/quanta-fan-control.service
 install -m 0644 "$repo_dir/modules-load.d/quanta-fan-control.conf" /etc/modules-load.d/quanta-fan-control.conf
 systemctl daemon-reload
-systemctl reset-failed quanta-fan-control.service
+if systemctl is-failed --quiet quanta-fan-control.service; then
+  systemctl reset-failed quanta-fan-control.service
+fi
 if ! systemctl enable --now quanta-fan-control.service; then
   systemctl stop quanta-fan-control.service || true
   /usr/bin/ipmitool raw 0x30 0xf9 0xff 0x01

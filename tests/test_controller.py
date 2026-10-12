@@ -20,6 +20,7 @@ Product ID                : 12882
 
 class ControllerTests(unittest.TestCase):
     def setUp(self):
+        controller.stop = False
         self.raw = json.loads((ROOT / 'config/quanta-fan-control.base.json').read_text())
         self.config = controller.validate_config(self.raw)
         self.fans = set(self.config['required_fans'])
@@ -166,6 +167,25 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(controller.manual(1), 1.6)
             self.assertEqual(command.call_args_list[1].args, ('raw', '0x30', '0xf9', '0x00', '0x1'))
 
+    def test_one_percent_cooldown_reaches_minimum_despite_bmc_rounding(self):
+        requested = 100
+        with patch.object(controller, 'command'):
+            effective = []
+            for _ in range(99):
+                requested = controller.cooldown(1, requested, 1)
+                effective.append(controller.manual(requested))
+        self.assertEqual(effective[0], 100)
+        self.assertLess(effective[1], 100)
+        self.assertEqual(requested, 1)
+        self.assertEqual(effective[-1], 1.6)
+        self.assertEqual(controller.cooldown(100, 1, 1), 100)
+
+    def test_cycle_delay_includes_work_and_never_becomes_negative(self):
+        with patch.object(controller.time, 'monotonic', return_value=10.4):
+            self.assertAlmostEqual(controller.remaining_delay(10, 1), .6)
+        with patch.object(controller.time, 'monotonic', return_value=13):
+            self.assertEqual(controller.remaining_delay(10, 1), 0)
+
     def test_exception_after_entering_manual_mode_restores_automatic(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(controller, 'read_config', return_value=self.config), \
@@ -179,6 +199,30 @@ class ControllerTests(unittest.TestCase):
                  patch('sys.argv', ['controller']), contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, 'write failed'):
                     controller.main()
+                automatic.assert_called_once()
+
+    def test_sensor_timeout_requests_full_speed_then_cools_without_restart(self):
+        requests = []
+        self.config['fall_percent_per_cycle'] = 1
+        def manual(target):
+            requests.append(target)
+            if len(requests) == 2:
+                controller.stop = True
+            return target
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(controller, 'read_config', return_value=self.config), \
+                 patch.object(controller, 'command', return_value=IDENTITY), \
+                 patch.object(controller, 'read_sensors', side_effect=[
+                     self.sensors, controller.subprocess.TimeoutExpired('ipmitool', 8), self.sensors]), \
+                 patch.object(controller, 'core_temperatures', return_value=(40, 100)), \
+                 patch.object(controller, 'STATE', str(Path(directory) / 'status.json')), \
+                 patch.object(controller, 'manual', side_effect=manual), \
+                 patch.object(controller, 'automatic') as automatic, \
+                 patch.object(controller, 'remaining_delay', return_value=0), \
+                 patch.object(controller, 'notify'), patch('signal.signal'), \
+                 patch('sys.argv', ['controller']), contextlib.redirect_stdout(io.StringIO()):
+                controller.main()
+                self.assertEqual(requests, [100, 99])
                 automatic.assert_called_once()
 
 

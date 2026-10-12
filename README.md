@@ -58,8 +58,12 @@ restart. The base configuration uses CPU-only, step-based control:
 Actual duty is rounded upward to the controller's BMC 1–63 scale: a 1% request
 uses raw level 1 and is reported as **1.6% effective duty**. RPM is measured separately
 and is not a direct percentage of maximum RPM. Falling duty is limited to three
-percentage points per cycle; rising duty is applied immediately. Each cycle
-includes sensor reads and IPMI commands, then the configured two-second delay.
+percentage points per cycle (or the configured `fall_percent_per_cycle`); rising
+duty is applied immediately. Cooldown tracks the unrounded request so small
+decrements accumulate across BMC steps. `interval_seconds` includes sensor reads
+and IPMI commands; only the remaining time is slept. Hardware reads may still
+take longer than the requested interval. Status includes `demand_percent`
+before cooldown and `cycle_work_seconds` for diagnosing timing.
 
 Curve points are `[temperature, duty_percent]`. Temperatures must increase,
 duty must remain within **1–100%** and must not decrease, and each non-empty curve
@@ -74,7 +78,9 @@ CPU-only mode.
 
 Missing/invalid temperatures, sensor alarms, fan faults, or CPU temperatures
 within 10°C of the hardware critical threshold request 100% duty. Startup health
-faults refuse activation. Configuration/read/command errors stop the controller;
+faults refuse activation. Runtime IPMI sensor-read errors request full speed
+and retry on the next cycle without resetting cooldown through a restart.
+Configuration, core-temperature-read, and fan-command errors stop the controller;
 the Python cleanup and systemd `ExecStopPost` restore BMC automatic control.
 The systemd watchdog covers a stalled userspace controller, with automatic
 control restored after watchdog termination. A host-wide freeze is outside that
@@ -83,6 +89,11 @@ watchdog's coverage.
 An optional inventory cache at `/var/lib/quanta-fan-control/sdr-cache.bin` is used
 when present. Live sensor readings are still fetched. No cache is required or
 shipped; regenerate it after hardware inventory changes.
+
+Avoid frequent competing IPMI collectors: they can slow BMC access and cause
+timeouts. Quanta2's separate node-exporter IPMI collector is kept at one minute;
+ordinary Prometheus scraping can still run every five seconds, but those cached
+hardware metrics only update when the collector completes.
 
 ## Inspect and recover
 
