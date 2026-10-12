@@ -20,7 +20,7 @@ Product ID                : 12882
 
 class ControllerTests(unittest.TestCase):
     def setUp(self):
-        self.raw = json.loads((ROOT / 'config/quanta-fan-control.json').read_text())
+        self.raw = json.loads((ROOT / 'config/quanta-fan-control.base.json').read_text())
         self.config = controller.validate_config(self.raw)
         self.fans = set(self.config['required_fans'])
         self.temps = {'CPU0 Temp', 'CPU1 Temp', 'PCH Temp', 'Ambient_Temp',

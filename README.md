@@ -36,6 +36,12 @@ been performed.
 
 ## Configuration
 
+The reusable base configuration is
+[`config/quanta-fan-control.base.json`](config/quanta-fan-control.base.json).
+New installations use this file; existing `/etc/quanta-fan-control.json` files
+are preserved. `config/quanta-fan-control.json` retains the original quanta1
+snapshot. To install a tuned copy of the base, use `--config /path/to/config.json`.
+
 Edit `/etc/quanta-fan-control.json`. Valid edits are read each cycle without a
 restart. The exported configuration uses CPU-only, step-based control:
 
@@ -118,7 +124,7 @@ bash -n scripts/install.sh scripts/uninstall.sh
 For a read-only check of a proposed configuration on supported hardware:
 
 ```bash
-python3 scripts/preflight.py --config config/quanta-fan-control.json
+python3 scripts/preflight.py --config config/quanta-fan-control.base.json
 ```
 
 Reference: [ipmitool system-interface documentation](https://github.com/ipmitool/ipmitool#system-interface).

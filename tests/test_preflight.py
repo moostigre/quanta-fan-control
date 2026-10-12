@@ -18,12 +18,12 @@ class PreflightTests(unittest.TestCase):
         controller = SimpleNamespace(main=lambda: print(json.dumps({'faults': faults})))
         fake_spec = SimpleNamespace(loader=SimpleNamespace(exec_module=Mock()))
         output, errors = io.StringIO(), io.StringIO()
-        with patch('sys.argv', ['preflight', '--config', str(ROOT / 'config/quanta-fan-control.json')]), \
+        with patch('sys.argv', ['preflight', '--config', str(ROOT / 'config/quanta-fan-control.base.json')]), \
              patch.object(preflight.importlib.util, 'spec_from_file_location', return_value=fake_spec), \
              patch.object(preflight.importlib.util, 'module_from_spec', return_value=controller), \
              contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             result = preflight.main()
-        self.assertEqual(controller.CONFIG, str(ROOT / 'config/quanta-fan-control.json'))
+        self.assertEqual(controller.CONFIG, str(ROOT / 'config/quanta-fan-control.base.json'))
         return result, json.loads(output.getvalue()), errors.getvalue()
 
     def test_healthy_read_only_check_allows_installation(self):

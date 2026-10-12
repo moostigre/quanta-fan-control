@@ -27,7 +27,7 @@ if [[ -z "$config_file" ]]; then
   if [[ -f /etc/quanta-fan-control.json ]]; then
     config_file=/etc/quanta-fan-control.json
   else
-    config_file="$repo_dir/config/quanta-fan-control.json"
+    config_file="$repo_dir/config/quanta-fan-control.base.json"
   fi
 fi
 [[ -f "$config_file" ]] || { echo "Configuration not found: $config_file" >&2; exit 1; }
