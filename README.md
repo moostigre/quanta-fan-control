@@ -81,11 +81,17 @@ CPU-only mode.
 Set `cpu_control_mode` to `"adaptive"` and `cpu_target_c` to `60` with
 `cpu_only: true` to replace normal curve steps with temperature feedback.
 The controller uses the hottest core or BMC CPU reading. It filters the
-temperature trend over roughly ten seconds and projects warming ten seconds
-ahead. Predicted temperatures above the target progressively increase the
-requested duty, capped at five percentage points per second. Stable readings
-in the 58-60 C band hold duty. Below 58 C, when not appreciably warming, duty
-falls gradually and remains subject to `fall_percent_per_cycle`.
+temperature trend over roughly ten seconds. Only within two degrees of the
+target, while the latest reading is still warming, it projects five seconds
+ahead, capped at two degrees of prediction. Predicted temperatures above the
+target progressively increase requested duty, capped at two percentage points
+per second. Actual temperatures above 60.5 C also request more airflow.
+Stable readings in the 58-60 C band hold duty even if a past load spike left a
+positive filtered trend. Below 58 C, when not warming, duty falls at one to
+five percentage points per second depending on distance below target.
+Adaptive cooldown uses actual elapsed time rather than `fall_percent_per_cycle`,
+which applies only in curve mode. BMC commands still update once per completed
+sensor cycle; a three-second cycle applies three seconds of cooldown at once.
 
 The first CPU curve duty is the minimum airflow; its final temperature still
 forces 100% immediately. Sensor faults and the hardware critical margin also

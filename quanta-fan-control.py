@@ -188,16 +188,22 @@ class AdaptiveCPU:
         weight = elapsed / (10 + elapsed)
         self.rate += weight * (measured_rate - self.rate)
         self.temperature, self.sample_time = temperature, now
-        self.predicted = temperature + max(0, self.rate) * 10
+        self.predicted = temperature + min(2, max(0, self.rate) * 5)
         target = config.get('cpu_target_c', 60)
         minimum = config['cpu_curve'][0][1]
         if temperature >= config['cpu_curve'][-1][0]:
             return 100
-        error = self.predicted - target
+        # Predict only near the target and require current warming, not just
+        # residual trend from a load spike that has already levelled off.
+        rising = measured_rate > .02 and self.rate > .02
+        error = self.predicted - target if rising and temperature >= target - 2 else 0
+        if temperature > target + .5:
+            error = max(error, temperature - target)
         if error > 0:
-            return min(100, max(minimum, previous + min(5, 4 * error) * elapsed))
-        if temperature < target - 2 and self.rate <= .02:
-            return max(minimum, previous - elapsed)
+            return min(100, max(minimum, previous + min(2, error) * elapsed))
+        if temperature < target - 2 and measured_rate <= .02:
+            fall_rate = min(5, max(1, (target - temperature) / 4))
+            return max(minimum, previous - fall_rate * elapsed)
         return max(minimum, previous)
 
 def main():
@@ -252,7 +258,8 @@ def main():
                 adaptive = AdaptiveCPU(cpu_max, time.monotonic())
             demand_percent = target
             # Never delay rising speed; let falling speed settle gradually.
-            target = cooldown(target, previous, config['fall_percent_per_cycle'])
+            if config.get('cpu_control_mode', 'curve') != 'adaptive':
+                target = cooldown(target, previous, config['fall_percent_per_cycle'])
             effective = manual(target); previous = target
             status = {'timestamp':time.time(),'duty_percent':effective,'target_percent':round(target,1),
                       'demand_percent':round(demand_percent,1),
