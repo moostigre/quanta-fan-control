@@ -184,6 +184,36 @@ five degrees abort the test, and nonzero fan-1 operation is checked afterward.
 Results are saved separately as `fan1-zero-duty-test.json`. This option is
 experimental and does not configure a permanent idle-stop policy.
 
+### Firmware inspection findings
+
+Offline inspection of the S210-X12RS V2 firmware 7.54 library shows that
+`QuantaSetFanSpeedCtrl` passes raw duties 0-63 to `SetSysFanDuty`. That function
+writes the requested byte directly through I2C bus 0 to address 0x2f, without
+a minimum-duty clamp in this path. Its selector/register mapping is:
+
+| Fan selector | W83793 bank-0 duty register |
+| --- | --- |
+| 1 | 0xb6 |
+| 2 | 0xb7 |
+| 3 | 0xb8 |
+| 4 | 0xb9 |
+| 5 | 0xba |
+| 6 | 0xb5 |
+
+`python3 scripts/inspect-fan-controller.py` reads these registers through IPMI
+Master Write-Read, writing only the register pointer, not configuration values.
+It refuses unexpected BMC identity or bank selection and never switches banks.
+Live quanta2 readings showed bank 0, output-style registers 0xb0/0xb1 both zero
+(open-drain PWM), and fan-1 duty register 0xb6 equal to 1.
+
+The generic AMI `disable_fan_control` library function targets the AST PWM/TACH
+driver; this is not evidence of a power switch for the external W83793-driven
+fans. `FanSpeedControlSet` toggles automatic control rather than fan power.
+No verified per-module power-cut command has been identified. The W83793's
+SmartFan NonStop/StopTime settings describe automatic PWM behavior, not a
+documented switch for disconnecting the fans' 12 V supply. Do not alter GPIOs
+or output modes without establishing board wiring and fan electrical behavior.
+
 These tests mock hardware access and require only Python's standard library:
 
 ```bash
