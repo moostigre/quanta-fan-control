@@ -1,0 +1,31 @@
+[Unit]
+Description=Quanta S210 temperature-based fan curve
+After=systemd-modules-load.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+ExecStart=/usr/local/sbin/quanta-fan-control.py
+ExecStopPost=/bin/sh -c '/usr/bin/ipmitool raw 0x30 0xf9 0xff 0x01 && echo "BMC automatic fan control restored"'
+Restart=on-failure
+RestartSec=5
+WatchdogSec=30
+WatchdogSignal=SIGKILL
+LimitCORE=0
+TimeoutStartSec=30
+TimeoutStopSec=15
+RuntimeDirectory=quanta-fan-control
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/quanta-fan-control
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+DevicePolicy=closed
+DeviceAllow=/dev/ipmi0 rw
+
+[Install]
+WantedBy=multi-user.target
