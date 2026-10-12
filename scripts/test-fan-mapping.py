@@ -32,6 +32,10 @@ def main():
     spec = importlib.util.spec_from_file_location('controller', source)
     controller = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(controller)
+    inspector_spec = importlib.util.spec_from_file_location(
+        'inspector', pathlib.Path(__file__).with_name('inspect-fan-controller.py'))
+    inspector = importlib.util.module_from_spec(inspector_spec)
+    inspector_spec.loader.exec_module(inspector)
     samples = []
 
     def sample(phase):
@@ -41,6 +45,15 @@ def main():
         temps = {n: s['value'] for n, s in sensors.items() if s['unit'] == 'degrees C' and s['value'] is not None}
         samples.append({'time': time.time(), 'phase': phase, 'core_max_c': core,
                         'temperatures_c': temps, 'rpm': fans})
+        if stop_test:
+            bank_before = inspector.read_register(0)
+            registers = {hex(r): inspector.read_register(r) for r in (0xb0, 0xb1, 0xb6)}
+            bank_after = inspector.read_register(0)
+            samples[-1]['controller_registers'] = registers
+            samples[-1]['bank_before'] = bank_before
+            samples[-1]['bank_after'] = bank_after
+            if bank_before & 7 or bank_after != bank_before:
+                raise RuntimeError('Controller bank changed; restoring normal control')
         report.write_text(json.dumps(samples, indent=2) + '\n')
         print(json.dumps(samples[-1]), flush=True)
         allowed_stopped = {'SYS_FAN1-1', 'SYS_FAN1-2'} if phase == 'selector-1-raw-0' else set()

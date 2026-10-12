@@ -214,6 +214,16 @@ SmartFan NonStop/StopTime settings describe automatic PWM behavior, not a
 documented switch for disconnecting the fans' 12 V supply. Do not alter GPIOs
 or output modes without establishing board wiring and fan electrical behavior.
 
+The zero-duty test now records bank selection, output styles, and fan-1 duty
+readback alongside RPM. On quanta2, register 0xb6 read 16 before the zero
+phase, 0 in all six zero-phase samples, and 16 after restoration. Both output
+style registers remained zero, and the bank remained zero. Fan-1 rotors
+settled around 4100-4200/2800 RPM despite zero duty readback, then returned to
+5400/3800 RPM at raw 16. CPU readings stayed 38-41 C. This rules out a persistent
+BMC rewrite of that duty register during these samples, but does not measure
+the electrical PWM waveform or prove which downstream component enforces
+the minimum. Normal controller operation was restored after the experiment.
+
 These tests mock hardware access and require only Python's standard library:
 
 ```bash
