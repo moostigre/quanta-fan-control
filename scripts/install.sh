@@ -42,7 +42,7 @@ python3 "$repo_dir/scripts/preflight.py" --config "$selected_config"
 backup_base=/var/backups/quanta-fan-control
 install -d -m 0700 "$backup_base"
 backup_dir="$(mktemp -d "$backup_base/$(date +%Y%m%d-%H%M%S).XXXXXX")"
-files=(usr/local/sbin/quanta-fan-control.py etc/quanta-fan-control.json
+files=(usr/local/sbin/quanta-fan-control.py usr/local/sbin/fan-control etc/init.d/fan etc/quanta-fan-control.json
        etc/systemd/system/quanta-fan-control.service etc/modules-load.d/quanta-fan-control.conf)
 for file in "${files[@]}"; do
   if [[ -e "/$file" ]]; then
@@ -60,6 +60,9 @@ if systemctl is-active --quiet quanta-fan-control.service; then
   systemctl stop quanta-fan-control.service
 fi
 install -m 0755 "$repo_dir/quanta-fan-control.py" /usr/local/sbin/quanta-fan-control.py
+install -m 0755 "$repo_dir/scripts/fan-control.py" /usr/local/sbin/fan-control
+install -d /etc/init.d
+install -m 0755 "$repo_dir/scripts/fan-service.sh" /etc/init.d/fan
 install -m 0644 "$selected_config" /etc/quanta-fan-control.json
 install -m 0644 "$repo_dir/systemd/quanta-fan-control.service" /etc/systemd/system/quanta-fan-control.service
 install -m 0644 "$repo_dir/modules-load.d/quanta-fan-control.conf" /etc/modules-load.d/quanta-fan-control.conf

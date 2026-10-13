@@ -282,6 +282,90 @@ def cooldown(target, previous, fall):
 def remaining_delay(started, interval):
     return max(0, started + interval - time.monotonic())
 
+def validate_control_request(request):
+    if not isinstance(request, dict) or request.get('action') not in ('set', 'auto'):
+        raise ValueError('Expected set or auto action')
+    selectors = request.get('fans', list(range(1, 7)))
+    if (not isinstance(selectors, list) or not selectors
+            or any(not isinstance(i, int) or isinstance(i, bool) or not 1 <= i <= 6 for i in selectors)
+            or len(set(selectors)) != len(selectors)):
+        raise ValueError('Fan selectors must be unique integers 1-6')
+    result = {'action': request['action'], 'fans': selectors}
+    if request['action'] == 'set':
+        percent = request.get('percent')
+        if (not isinstance(percent, (int, float)) or isinstance(percent, bool)
+                or not math.isfinite(percent) or not 1 <= percent <= 100):
+            raise ValueError('Manual fan duty must be 1-100%')
+        result['percent'] = percent
+    return result
+
+
+class ControlServer:
+    """Root-only datagram commands; the daemon remains the sole IPMI writer."""
+    def __init__(self, path):
+        self.path = pathlib.Path(path)
+        self.overrides = {}
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        # RuntimeDirectory is removed on stop. A stale socket from an interrupted
+        # daemon can be replaced; never replace an unrelated regular file.
+        if self.path.exists():
+            if not self.path.is_socket():
+                self.socket.close()
+                raise RuntimeError('Control socket path is not a socket')
+            self.path.unlink()
+        try:
+            self.socket.bind(str(self.path))
+            self.path.chmod(0o600)
+            self.socket.setblocking(False)
+        except Exception:
+            self.socket.close()
+            raise
+
+    def reply(self, address, result):
+        try:
+            self.socket.sendto(json.dumps(result).encode(), address)
+        except (OSError, TypeError):
+            pass  # disconnected clients must not interrupt fan safety/control
+
+    def poll(self):
+        pending, force = [], set()
+        for _ in range(16):
+            try:
+                data, address = self.socket.recvfrom(4097)
+            except BlockingIOError:
+                break
+            request_id = None
+            try:
+                if len(data) > 4096: raise ValueError('Control request is too large')
+                request = json.loads(data)
+                request_id = request.get('id') if isinstance(request, dict) else None
+                if not isinstance(request_id, str) or not 1 <= len(request_id) <= 64:
+                    raise ValueError('Control request requires an id')
+                parsed = validate_control_request(request)
+                if parsed['action'] == 'set':
+                    for i in parsed['fans']: self.overrides[i] = parsed['percent']
+                    force.update(parsed['fans'])
+                else:
+                    force.update(i for i in parsed['fans'] if i in self.overrides)
+                    for i in parsed['fans']: self.overrides.pop(i, None)
+                pending.append((request_id, address))
+            except (ValueError, TypeError, UnicodeDecodeError) as error:
+                self.reply(address, {'id': request_id, 'ok': False, 'error': str(error)})
+        return pending, force
+
+    def acknowledge(self, pending, status):
+        for request_id, address in pending:
+            self.reply(address, {'id': request_id, 'ok': True,
+                'manual_overrides': status['manual_overrides'],
+                'fan_duty_percent': status['fan_duty_percent'],
+                'safety_override': status['manual_safety_override'],
+                'faults': status['faults']})
+
+    def close(self):
+        self.socket.close()
+        self.path.unlink(missing_ok=True)
+
+
 class StagedFans:
     """Allocate CPU airflow in priority order; hold quantized PWM between writes."""
     def __init__(self):
@@ -320,7 +404,7 @@ class StagedFans:
             for selector in group: result[selector] = max(idle, value)
         return result
 
-    def apply(self, config, demand, now, emergency=False, urgent=False):
+    def apply(self, config, demand, now, emergency=False, urgent=False, overrides=None, force=()):
         options = staging_options(config)
         signature = json.dumps(options, sort_keys=True)
         if signature != self.signature:
@@ -338,14 +422,20 @@ class StagedFans:
             self.refreshed_at = now
             self.active = [True] * 3
             return {str(i): 100.0 for i in self.raw}
-        targets = self.targets(options, demand, now, urgent)
+        if options['enabled']:
+            targets = self.targets(options, demand, now, urgent)
+        else:
+            targets = {i: demand for i in range(1, 7)}
+            self.active = [True] * 3
+        for i, percent in (overrides or {}).items():
+            targets[i] = max(targets[i], percent) if urgent else percent
         refresh = self.refreshed_at is None or now - self.refreshed_at >= options['refresh_seconds']
         changes = {}
         for i in range(1, 7):
             desired = max(1, min(63, targets[i] * 63 / 100))
             requested = math.ceil(desired)
             current = self.raw.get(i)
-            if current is None or urgent:
+            if current is None or urgent or i in force:
                 candidate = requested
             elif now - self.changed_at[i] < options['output_hold_seconds']:
                 candidate = current
@@ -357,7 +447,7 @@ class StagedFans:
                 candidate = max(requested, current - options['output_step_raw'])
             else:
                 candidate = current
-            if candidate != current: changes[i] = candidate
+            if candidate != current or i in force: changes[i] = candidate
         if refresh:
             command('raw', '0x30', '0xf9', '0xff', '0x00')
         for i in range(1, 7):
@@ -427,7 +517,7 @@ class AdaptiveCPU:
         self.state = 'starting'
         self.load_available = False
 
-    def update(self, config, temperature, previous, now, load=None):
+    def update(self, config, temperature, previous, now, load=None, learn=True):
         options = predictive_options(config)
         signature = json.dumps([config['cpu_curve'], config.get('curve_mode', 'linear'),
                                 config.get('cpu_target_c', 60), options], sort_keys=True)
@@ -492,8 +582,8 @@ class AdaptiveCPU:
         cool = (not warming and temperature < target - band
                 and self.filtered < target - band
                 and self.load_fast <= self.load_slow + 5)
-        self.hot_since = (now if self.hot_since is None else self.hot_since) if hot else None
-        self.cool_since = (now if self.cool_since is None else self.cool_since) if cool else None
+        self.hot_since = (now if self.hot_since is None else self.hot_since) if hot and learn else None
+        self.cool_since = (now if self.cool_since is None else self.cool_since) if cool and learn else None
         self.state = 'hold'
         if (self.hot_since is not None
                 and now - self.hot_since >= options['trim_interval_seconds']
@@ -559,11 +649,14 @@ def main():
     cpu_load = CPULoad()
     cpu_load.sample()  # establish counters without waiting or making BMC reads
     staged_fans = StagedFans()
+    control = None
     try:
+        control = ControlServer(pathlib.Path(STATE).parent / 'control.sock')
         notify('READY=1')
         while not stop:
             cycle_started = time.monotonic()
             config = read_config() # edits take effect without a restart
+            pending, force = control.poll()
             tracked_fans.update(config['required_fans'])
             sensor_started = time.monotonic()
             try:
@@ -587,7 +680,8 @@ def main():
             load = cpu_load.sample()
             predictive = config.get('cpu_control_mode', 'curve') in ('adaptive', 'predictive')
             if predictive and not reasons:
-                target = adaptive.update(config, cpu_max, previous, time.monotonic(), load)
+                target = adaptive.update(config, cpu_max, previous, time.monotonic(), load,
+                                         learn=not control.overrides)
             else:
                 adaptive = AdaptiveCPU(cpu_max, time.monotonic())
                 adaptive.state = 'fault' if reasons else 'curve'
@@ -597,10 +691,12 @@ def main():
             # Never delay rising speed; let falling speed settle gradually.
             if not predictive:
                 target = cooldown(target, previous, config['fall_percent_per_cycle'])
-            if staging_options(config)['enabled']:
+            emergency = bool(reasons) or cpu_max >= config['cpu_curve'][-1][0]
+            urgent = cpu_max >= config['cpu_curve'][-1][0] - 3
+            if staging_options(config)['enabled'] or control.overrides or force:
                 fan_duties = staged_fans.apply(config, target, time.monotonic(),
-                    emergency=bool(reasons) or cpu_max >= config['cpu_curve'][-1][0],
-                    urgent=cpu_max >= config['cpu_curve'][-1][0] - 3)
+                    emergency=emergency, urgent=urgent,
+                    overrides=control.overrides, force=force)
                 effective = max(fan_duties.values())
                 fan_status = staged_fans.status()
             else:
@@ -615,6 +711,10 @@ def main():
                       'demand_percent':round(demand_percent,1),
                       'fan_duty_percent':fan_duties,
                       'fan_control_mode':'staged' if staging_options(config)['enabled'] else 'uniform',
+                      'manual_overrides':{str(i):v for i,v in control.overrides.items()},
+                      'control_mode':('manual' if len(control.overrides) == 6 else
+                                      'mixed' if control.overrides else 'auto'),
+                      'manual_safety_override':bool(control.overrides) and (emergency or urgent),
                       'cycle_work_seconds':round(time.monotonic()-cycle_started,3),
                       'cpu_control_mode':config.get('cpu_control_mode', 'curve'),
                       'cpu_target_c':config.get('cpu_target_c', 60),
@@ -627,6 +727,7 @@ def main():
             status.update(adaptive.status())
             status.update(fan_status)
             temporary = pathlib.Path(STATE + '.tmp'); temporary.write_text(json.dumps(status,indent=2)); temporary.replace(STATE)
+            control.acknowledge(pending, status)  # acknowledge after hardware writes/status publication
             exporter = '/usr/local/sbin/ipmi-metrics-5s.py'
             if pathlib.Path(exporter).is_file():
                 try:
@@ -645,7 +746,10 @@ def main():
         if not stop:
             raise
     finally:
-        automatic()
+        try:
+            automatic()
+        finally:
+            if control is not None: control.close()
         print('Restored native BMC automatic fan control',flush=True)
 
 if __name__ == '__main__': main()

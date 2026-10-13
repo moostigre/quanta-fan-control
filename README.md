@@ -264,6 +264,54 @@ timeouts. Quanta2's separate node-exporter IPMI collector is kept at one minute;
 ordinary Prometheus scraping can still run every five seconds, but those cached
 hardware metrics only update when the collector completes.
 
+## Manual fan commands
+
+Run as root (or prefix `sudo`). The requested command spelling is supported:
+
+```bash
+service fan control set fan1 100%
+service fan control set fans 100%
+service fan control set auto on
+```
+
+`fan1` through `fan6` select physical modules, each with both rotor channels.
+`fans` selects all six. An individual manual setting leaves the other modules
+under their configured automatic control. Acceptable duties are 1-100%, with
+optional decimal values and `%`; the hardware rounds to its 1-63 PWM scale.
+Zero is rejected because this interface has not provided a verified fan-stop
+function. Explicit manual changes apply immediately, bypassing normal output
+holds. No direct IPMI command is issued by the client.
+
+`set auto on` clears every manual override and resumes the currently configured
+predictive/staged or curve controller; it also starts that service if stopped.
+It does **not** select native BMC automatic control. To release just one module:
+
+```bash
+service fan control set fan3 auto
+service fan control status
+```
+
+The same operations are available as `fan-control set fan1 100%`,
+`fan-control set fans 100%`, `fan-control set auto on`, and `fan-control status`.
+The `fan` init script is a command wrapper; the supervised daemon remains
+`quanta-fan-control.service`.
+
+The running daemon accepts commands through its root-only UNIX socket and
+acknowledges them after applying hardware output and publishing status. It
+continues sensor/fan monitoring during manual operation. Thermal guard bands
+can raise a manual setting; the configured full-speed endpoint and hardware
+faults force all six modules to 100%, regardless of requested duty. Replies
+report effective duties and any active safety override. Manual values remain
+requested and take effect again when the safety override clears.
+
+Overrides are held in memory, never written into the editable JSON. They last
+until released or until the daemon restarts/reboots. Prediction continues while
+manual overrides exist, but temperature correction learning pauses so manually
+added airflow cannot teach the automatic controller an incorrect cooling
+correction. Status adds `control_mode` (`auto`, `mixed`, or `manual`),
+`manual_overrides`, and `manual_safety_override` alongside per-module duty.
+Existing fault cleanup and watchdog restoration to native BMC control remain.
+
 ## Inspect and recover
 
 ```bash
