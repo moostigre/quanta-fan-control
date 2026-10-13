@@ -186,42 +186,6 @@ class ControllerTests(unittest.TestCase):
         with patch.object(controller.time, 'monotonic', return_value=13):
             self.assertEqual(controller.remaining_delay(10, 1), 0)
 
-    def test_adaptive_holds_stable_airflow_in_target_band(self):
-        adaptive = controller.AdaptiveCPU(59, 0)
-        self.assertEqual(adaptive.update(self.config, 59, 20, 3), 20)
-        self.assertEqual(adaptive.update(self.config, 59, 20, 6), 20)
-
-    def test_adaptive_ramps_on_warming_before_target(self):
-        adaptive = controller.AdaptiveCPU(57, 0)
-        requested = adaptive.update(self.config, 59.5, 10, 2)
-        self.assertGreater(adaptive.predicted, 60)
-        self.assertGreater(requested, 10)
-        self.assertLessEqual(requested, 20)
-
-    def test_adaptive_cools_gradually_and_obeys_full_speed_limit(self):
-        adaptive = controller.AdaptiveCPU(55, 0)
-        self.assertEqual(adaptive.update(self.config, 55, 20, 2), 17.5)
-        self.assertEqual(adaptive.update(self.config, 55, 1, 4), 1)
-        self.assertEqual(adaptive.update(self.config, 65, 20, 6), 100)
-
-    def test_adaptive_increases_when_temperature_is_above_target_even_if_stable(self):
-        adaptive = controller.AdaptiveCPU(61, 0)
-        self.assertGreater(adaptive.update(self.config, 61, 20, 2), 20)
-
-    def test_adaptive_does_not_keep_ramping_after_load_levels_off(self):
-        adaptive = controller.AdaptiveCPU(40, 0)
-        duty = adaptive.update(self.config, 60, 10, 3)
-        for now in [6, 9, 12, 15]:
-            self.assertEqual(adaptive.update(self.config, 60, duty, now), duty)
-
-    def test_adaptive_load_spike_at_50_does_not_ramp(self):
-        adaptive = controller.AdaptiveCPU(35, 0)
-        self.assertEqual(adaptive.update(self.config, 50, 10, 3), 10)
-
-    def test_adaptive_cooldown_accounts_for_elapsed_time(self):
-        adaptive = controller.AdaptiveCPU(40, 0)
-        self.assertEqual(adaptive.update(self.config, 40, 100, 3), 85)
-
     def test_adaptive_configuration_rejects_invalid_targets_and_multisensor_mode(self):
         self.raw['cpu_control_mode'] = 'adaptive'
         for value in [False, 39, 61, float('nan')]:
@@ -272,6 +236,40 @@ class ControllerTests(unittest.TestCase):
                 controller.main()
                 self.assertEqual(requests, [100, 99])
                 automatic.assert_called_once()
+
+    def test_predictive_sensor_fault_bypasses_slew_and_recovers_with_status(self):
+        self.config['cpu_control_mode'] = 'predictive'
+        requests = []
+        def manual(target):
+            requests.append(target)
+            if len(requests) == 2:
+                controller.stop = True
+            return target
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / 'status.json'
+            with patch.object(controller, 'read_config', return_value=self.config), \
+                 patch.object(controller, 'command', return_value=IDENTITY), \
+                 patch.object(controller, 'read_sensors', side_effect=[self.sensors,
+                     controller.subprocess.TimeoutExpired('ipmitool', 8), self.sensors]), \
+                 patch.object(controller, 'core_temperatures', return_value=(40, 100)), \
+                 patch.object(controller, 'STATE', str(status_file)), \
+                 patch.object(controller, 'manual', side_effect=manual), \
+                 patch.object(controller, 'automatic') as automatic, \
+                 patch.object(controller.CPULoad, 'sample', return_value=92), \
+                 patch.object(controller, 'remaining_delay', return_value=0), \
+                 patch.object(controller, 'notify'), patch('signal.signal'), \
+                 patch('sys.argv', ['controller']), contextlib.redirect_stdout(io.StringIO()):
+                controller.main()
+            self.assertEqual(requests[0], 100)
+            self.assertTrue(99 <= requests[1] < 100)
+            status = json.loads(status_file.read_text())
+            self.assertEqual(status['faults'], [])
+            self.assertEqual(status['ipmi_sensors'], self.sensors)
+            self.assertIsNotNone(status['ipmi_read_timestamp_seconds'])
+            self.assertEqual(status['cpu_load_percent'], 92)
+            self.assertTrue(status['cpu_load_available'])
+            self.assertIn('cpu_load_demand_percent', status)
+            automatic.assert_called_once()
 
 
 if __name__ == '__main__':

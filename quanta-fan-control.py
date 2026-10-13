@@ -2,7 +2,8 @@
 """Quanta S210-X12RS firmware 7.54 fan controller. No firmware writes.
 Config points are [temperature C, duty percent]. Highest thermal demand wins.
 Empty lists inherit the first non-empty curve in CURVE_KEYS order (CPU first).
-With cpu_only=true only CPU temperature determines normal duty.
+With cpu_only=true only CPU inputs determine normal duty; predictive/adaptive
+mode also anticipates heating from local CPU utilization.
 With curve_mode=step each speed is held until the next temperature threshold.
 On normal exit and systemd watchdog failure, return to native BMC control.
 A host-wide freeze cannot be covered by a userspace/systemd watchdog.
@@ -40,6 +41,59 @@ def manual(percent):
 CURVE_KEYS = ('cpu_curve', 'dimm_curve', 'pch_curve', 'ambient_curve',
               'backplane_curve', 'inlet_curve', 'exhaust_curve')
 MINIMUM_DUTY_PERCENT = 1
+PREDICTIVE_DEFAULTS = {
+    'load_curve': [[0, 1], [25, 8], [50, 15], [75, 22], [100, 28]],
+    'temperature_filter_seconds': 5,
+    'prediction_seconds': 10,
+    'prediction_max_c': 3,
+    'load_prediction_c': 3,
+    'deadband_c': 1,
+    'trim_step_percent': 100 / 63,
+    'trim_interval_seconds': 15,
+    'cooldown_hold_seconds': 30,
+    'cooldown_interval_seconds': 20,
+    'rise_percent_per_second': 1,
+    'fall_percent_per_second': .25,
+    'max_trim_percent': 30,
+}
+
+def predictive_options(config):
+    return dict(PREDICTIVE_DEFAULTS, **config.get('predictive', {}))
+
+def validate_predictive(config):
+    supplied = config.get('predictive', {})
+    if not isinstance(supplied, dict) or set(supplied) - set(PREDICTIVE_DEFAULTS):
+        raise ValueError('predictive must be an object containing supported options')
+    options = predictive_options(config)
+    bounds = {
+        'temperature_filter_seconds': (1, 15), 'prediction_seconds': (0, 20),
+        'prediction_max_c': (0, 5), 'load_prediction_c': (0, 5),
+        'deadband_c': (.5, 2), 'trim_step_percent': (.5, 5),
+        'trim_interval_seconds': (5, 60), 'cooldown_hold_seconds': (10, 120),
+        'cooldown_interval_seconds': (10, 120),
+        'rise_percent_per_second': (.1, 5), 'fall_percent_per_second': (.05, 1),
+        'max_trim_percent': (5, 50),
+    }
+    for key, (low, high) in bounds.items():
+        value = options[key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not low <= value <= high):
+            raise ValueError('predictive.' + key + ': expected %s-%s' % (low, high))
+    points = options['load_curve']
+    if not isinstance(points, list) or len(points) < 2:
+        raise ValueError('predictive.load_curve requires at least two points')
+    previous = (-1, 0)
+    for point in points:
+        if (not isinstance(point, (list, tuple)) or len(point) != 2
+                or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                           and math.isfinite(v) for v in point)):
+            raise ValueError('predictive.load_curve requires finite [load percent, duty] points')
+        load, duty = point
+        if not previous[0] < load <= 100 or not previous[1] <= duty <= 100 or duty < 1:
+            raise ValueError('predictive.load_curve requires increasing loads and 1-100% duties')
+        previous = (load, duty)
+    if points[0][0] != 0 or points[-1][0] != 100:
+        raise ValueError('predictive.load_curve must cover 0-100% CPU utilization')
 
 def validate_config(c):
     """Resolve empty curves in memory; keep the editable file unchanged."""
@@ -76,11 +130,12 @@ def validate_config(c):
         raise ValueError('cpu_only must be true or false')
     if resolved.get('curve_mode', 'linear') not in ('linear', 'step'):
         raise ValueError('curve_mode must be linear or step')
-    if resolved.get('cpu_control_mode', 'curve') not in ('curve', 'adaptive'):
-        raise ValueError('cpu_control_mode must be curve or adaptive')
-    if resolved.get('cpu_control_mode') == 'adaptive':
+    if resolved.get('cpu_control_mode', 'curve') not in ('curve', 'adaptive', 'predictive'):
+        raise ValueError('cpu_control_mode must be curve, adaptive or predictive')
+    validate_predictive(resolved)
+    if resolved.get('cpu_control_mode') in ('adaptive', 'predictive'):
         if not resolved.get('cpu_only', False):
-            raise ValueError('Adaptive CPU control requires cpu_only=true')
+            raise ValueError('Predictive/adaptive CPU control requires cpu_only=true')
         target = resolved.get('cpu_target_c', 60)
         if (isinstance(target, bool) or not isinstance(target, (int, float))
                 or not math.isfinite(target) or not 40 <= target <= 60
@@ -175,36 +230,161 @@ def cooldown(target, previous, fall):
 def remaining_delay(started, interval):
     return max(0, started + interval - time.monotonic())
 
-class AdaptiveCPU:
-    """Hold airflow in the target band; react to a filtered warming trend."""
-    def __init__(self, temperature, now):
-        self.temperature, self.sample_time = temperature, now
-        self.rate = 0.0
-        self.predicted = temperature
+class CPULoad:
+    """Host CPU busy time, including guests once; exclude idle, iowait and steal."""
+    def __init__(self, path='/proc/stat'):
+        self.path, self.previous, self.available = path, None, False
 
-    def update(self, config, temperature, previous, now):
+    def sample(self):
+        try:
+            lines = pathlib.Path(self.path).read_text().splitlines()
+            fields = next(line.split()[1:] for line in lines if line.startswith('cpu '))
+            values = tuple(int(v) for v in fields[:8])
+            count = sum(line.split()[0][3:].isdigit() for line in lines if line.startswith('cpu'))
+            if len(values) != 8 or any(v < 0 for v in values) or not count:
+                raise ValueError('Invalid /proc/stat CPU counters')
+        except (OSError, ValueError, StopIteration):
+            self.previous, self.available = None, False
+            return None
+        previous, self.previous = self.previous, (values, count)
+        self.available = False
+        if previous is None or previous[1] != count:
+            return None
+        # iowait is documented to sometimes decrease; other regressions reset
+        # the sample. guest/guest_nice are already counted in user/nice.
+        deltas = [v - old for v, old in zip(values, previous[0])]
+        if any(v < 0 for i, v in enumerate(deltas) if i != 4):
+            return None
+        deltas[4] = max(0, deltas[4])
+        total = sum(deltas)
+        if total <= 0:
+            return None
+        self.available = True
+        return 100 * sum(deltas[i] for i in (0, 1, 2, 5, 6)) / total
+
+
+class AdaptiveCPU:
+    """Curve-guided load feed-forward with bounded prediction and timed trim.
+
+    CPU utilization is a heat hint, not a power measurement. Temperature
+    feedback learns a signed correction to its provisional airflow estimate.
+    Never integrate temperature error every second or carry an emergency duty
+    into the next normal target.
+    """
+    def __init__(self, temperature, now):
+        self.temperature = self.filtered = self.predicted = temperature
+        self.sample_time = self.last_trim = now
+        self.rate = self.load = self.load_fast = self.load_slow = 0.0
+        self.trim = self.curve_duty = self.load_duty = self.desired = 0.0
+        self.trim_load = 0.0
+        self.hot_since = self.cool_since = None
+        self.signature = None
+        self.state = 'starting'
+        self.load_available = False
+
+    def update(self, config, temperature, previous, now, load=None):
+        options = predictive_options(config)
+        signature = json.dumps([config['cpu_curve'], config.get('curve_mode', 'linear'),
+                                config.get('cpu_target_c', 60), options], sort_keys=True)
+        if self.signature is not None and signature != self.signature:
+            self.__init__(temperature, now)
+        self.signature = signature
         elapsed = max(.001, now - self.sample_time)
-        measured_rate = (temperature - self.temperature) / elapsed
-        weight = elapsed / (10 + elapsed)
-        self.rate += weight * (measured_rate - self.rate)
+        # A slow sensor read must not produce a catch-up burst of output changes.
+        slew_time = min(5, elapsed)
+        temperature_change = temperature - self.temperature
+        measured_rate = temperature_change / elapsed
+        old_filtered = self.filtered
+        self.filtered += -math.expm1(-elapsed / options['temperature_filter_seconds']) * (temperature - self.filtered)
+        filtered_rate = (self.filtered - old_filtered) / elapsed
+        self.rate += -math.expm1(-elapsed / 10) * (filtered_rate - self.rate)
         self.temperature, self.sample_time = temperature, now
-        self.predicted = temperature + min(2, max(0, self.rate) * 5)
+        self.load_available = load is not None and math.isfinite(load) and 0 <= load <= 100
+        if self.load_available:
+            # Feed-forward rises promptly and releases slowly after load ends.
+            self.load_fast += -math.expm1(-elapsed / 3) * (load - self.load_fast)
+            self.load_slow += -math.expm1(-elapsed / 30) * (load - self.load_slow)
+            load_tau = 3 if load > self.load else 45
+            self.load += -math.expm1(-elapsed / load_tau) * (load - self.load)
+            if self.trim < 0 and self.load > self.trim_load + 15:
+                self.trim = max(0, self.trim)  # do not reuse a low-load cooling correction
+        load_lead = (max(0, self.load_fast - self.load_slow) / 100
+                     * options['load_prediction_c']
+                     if self.load_available and measured_rate >= 0 and filtered_rate >= 0 else 0)
+        # Suppress residual positive trend as soon as the raw CPU starts cooling.
+        trend_lead = (max(0, self.rate) * options['prediction_seconds']
+                      if measured_rate >= 0 and filtered_rate >= 0 else 0)
+        self.predicted = self.filtered + min(options['prediction_max_c'], trend_lead + load_lead)
         target = config.get('cpu_target_c', 60)
-        minimum = config['cpu_curve'][0][1]
-        if temperature >= config['cpu_curve'][-1][0]:
+        band = options['deadband_c']
+        full_speed = config['cpu_curve'][-1][0]
+        if temperature >= full_speed:
+            self.trim = 0
+            self.curve_duty = 100
+            self.load_duty = interpolate(options['load_curve'], self.load)
+            self.hot_since = self.cool_since = None
+            self.state, self.desired = 'emergency', 100
             return 100
-        # Predict only near the target and require current warming, not just
-        # residual trend from a load spike that has already levelled off.
-        rising = measured_rate > .02 and self.rate > .02
-        error = self.predicted - target if rising and temperature >= target - 2 else 0
-        if temperature > target + .5:
-            error = max(error, temperature - target)
-        if error > 0:
-            return min(100, max(minimum, previous + min(2, error) * elapsed))
-        if temperature < target - 2 and measured_rate <= .02:
-            fall_rate = min(5, max(1, (target - temperature) / 4))
-            return max(minimum, previous - fall_rate * elapsed)
-        return max(minimum, previous)
+        # Forecasts may select ordinary curve points, never the final emergency
+        # point. Only raw temperature or hardware health forces full speed.
+        mode = config.get('curve_mode', 'linear')
+        curve_temperature = min(self.predicted, full_speed - .001)
+        self.curve_duty = interpolate(config['cpu_curve'], curve_temperature, mode)
+        self.load_duty = interpolate(options['load_curve'], self.load)
+        baseline = max(self.curve_duty, self.load_duty)
+        minimum_trim = max(-options['max_trim_percent'], self.curve_duty - baseline)
+        # Anti-windup: once the JSON curve is the floor, extra negative
+        # correction cannot affect output and must not accumulate invisibly.
+        self.trim = max(minimum_trim, self.trim)
+        # One-degree BMC quantization must not restart the settling timers on
+        # every alternating reading. A clear drop or sustained trend still
+        # stops warming corrections promptly.
+        cooling = temperature_change <= -2 or self.rate < -.03 or filtered_rate < -.15
+        warming = temperature_change >= 2 or self.rate > .03
+        hot = (not cooling and self.filtered >= target - band
+               and (self.filtered > target + band + .05
+                    or (warming and self.predicted > target + band + .1)))
+        cool = (not warming and temperature < target - band
+                and self.filtered < target - band
+                and self.load_fast <= self.load_slow + 5)
+        self.hot_since = (now if self.hot_since is None else self.hot_since) if hot else None
+        self.cool_since = (now if self.cool_since is None else self.cool_since) if cool else None
+        self.state = 'hold'
+        if (self.hot_since is not None
+                and now - self.hot_since >= options['trim_interval_seconds']
+                and now - self.last_trim >= options['trim_interval_seconds']):
+            self.trim = min(options['max_trim_percent'], self.trim + options['trim_step_percent'])
+            self.last_trim = self.hot_since = now
+            self.trim_load = self.load
+            self.state = 'step_up'
+        elif (self.cool_since is not None
+                and now - self.cool_since >= options['cooldown_hold_seconds']
+                and now - self.last_trim >= options['cooldown_interval_seconds']):
+            self.trim = max(minimum_trim, self.trim - options['trim_step_percent'])
+            self.last_trim = now
+            self.trim_load = self.load
+            self.state = 'step_down'
+        self.desired = min(100, max(self.curve_duty, baseline + self.trim))
+        rise = options['rise_percent_per_second']
+        if temperature >= full_speed - 3:
+            # Smooth guard band as raw temperature approaches the hard endpoint.
+            self.desired = max(self.desired, 100 * (temperature - full_speed + 3) / 3)
+            rise = max(rise, 10)
+            self.state = 'high_temperature'
+        return min(previous + rise * slew_time,
+                   max(self.desired, previous - options['fall_percent_per_second'] * slew_time))
+
+    def status(self):
+        return {'cpu_filtered_c': round(self.filtered, 2),
+                'cpu_predicted_c': round(self.predicted, 2),
+                'cpu_trend_c_per_second': round(self.rate, 4),
+                'cpu_load_filtered_percent': round(self.load, 2),
+                'cpu_load_available': self.load_available,
+                'cpu_curve_demand_percent': round(self.curve_duty, 2),
+                'cpu_load_demand_percent': round(self.load_duty, 2),
+                'cpu_trim_percent': round(self.trim, 2),
+                'cpu_desired_percent': round(self.desired, 2),
+                'cpu_controller_state': self.state}
 
 def main():
     parser = argparse.ArgumentParser()
@@ -231,6 +411,8 @@ def main():
     previous, last_log, last_event = target, 0, None
     adaptive = AdaptiveCPU(max(core_max, temperatures['CPU0 Temp'], temperatures['CPU1 Temp']),
                            time.monotonic())
+    cpu_load = CPULoad()
+    cpu_load.sample()  # establish counters without waiting or making BMC reads
     try:
         notify('READY=1')
         while not stop:
@@ -256,13 +438,18 @@ def main():
             if read_error:
                 reasons.append('sensor read failed: ' + read_error)
             cpu_max = max(core_max, temperatures.get('CPU0 Temp', 0), temperatures.get('CPU1 Temp', 0))
-            if config.get('cpu_control_mode', 'curve') == 'adaptive' and not reasons:
-                target = adaptive.update(config, cpu_max, previous, time.monotonic())
+            load = cpu_load.sample()
+            predictive = config.get('cpu_control_mode', 'curve') in ('adaptive', 'predictive')
+            if predictive and not reasons:
+                target = adaptive.update(config, cpu_max, previous, time.monotonic(), load)
             else:
                 adaptive = AdaptiveCPU(cpu_max, time.monotonic())
-            demand_percent = target
+                adaptive.state = 'fault' if reasons else 'curve'
+                adaptive.desired = target
+                adaptive.load_available = load is not None
+            demand_percent = adaptive.desired if predictive and not reasons else target
             # Never delay rising speed; let falling speed settle gradually.
-            if config.get('cpu_control_mode', 'curve') != 'adaptive':
+            if not predictive:
                 target = cooldown(target, previous, config['fall_percent_per_cycle'])
             effective = manual(target); previous = target
             status = {'timestamp':time.time(),'ipmi_read_timestamp_seconds':sensor_timestamp,
@@ -272,13 +459,13 @@ def main():
                       'cycle_work_seconds':round(time.monotonic()-cycle_started,3),
                       'cpu_control_mode':config.get('cpu_control_mode', 'curve'),
                       'cpu_target_c':config.get('cpu_target_c', 60),
-                      'cpu_trend_c_per_second':round(adaptive.rate,4),
-                      'cpu_predicted_c':round(adaptive.predicted,2),
+                      'cpu_load_percent':round(load, 2) if load is not None else None,
                       'cpu_core_max_c':core_max,'temperatures_c':temperatures,'faults':reasons,
                       'rpm':{n:sensors.get(n,{}).get('value') for n in sorted(tracked_fans)},
                       'curve_sources':config['curve_sources'],
                       'cpu_only':config.get('cpu_only', False),
                       'curve_mode':config.get('curve_mode','linear')}
+            status.update(adaptive.status())
             temporary = pathlib.Path(STATE + '.tmp'); temporary.write_text(json.dumps(status,indent=2)); temporary.replace(STATE)
             exporter = '/usr/local/sbin/ipmi-metrics-5s.py'
             if pathlib.Path(exporter).is_file():

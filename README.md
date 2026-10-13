@@ -76,30 +76,114 @@ non-empty curve, in CPU/DIMM/PCH/ambient/backplane/inlet/exhaust order. Set
 highest demand wins. Temperature and fan health checks remain active in
 CPU-only mode.
 
-### Adaptive CPU temperature control
+### Load-aware predictive CPU control
 
-Set `cpu_control_mode` to `"adaptive"` and `cpu_target_c` to `60` with
-`cpu_only: true` to replace normal curve steps with temperature feedback.
-The controller uses the hottest core or BMC CPU reading. It filters the
-temperature trend over roughly ten seconds. Only within two degrees of the
-target, while the latest reading is still warming, it projects five seconds
-ahead, capped at two degrees of prediction. Predicted temperatures above the
-target progressively increase requested duty, capped at two percentage points
-per second. Actual temperatures above 60.5 C also request more airflow.
-Stable readings in the 58-60 C band hold duty even if a past load spike left a
-positive filtered trend. Below 58 C, when not warming, duty falls at one to
-five percentage points per second depending on distance below target.
-Adaptive cooldown uses actual elapsed time rather than `fall_percent_per_cycle`,
-which applies only in curve mode. BMC commands still update once per completed
-sensor cycle; a three-second cycle applies three seconds of cooldown at once.
+Use `cpu_control_mode: "predictive"`, `cpu_only: true`, and `cpu_target_c: 60`.
+Existing `"adaptive"` configurations now use this same controller: upgrades
+replace the old per-second error accumulator and rapid cooldown. `"curve"`
+mode keeps its original step/linear behavior. The installer preserves existing
+configuration, so an existing adaptive installation adopts the new behavior
+without replacing its temperature curve or full-speed endpoint.
 
-The first CPU curve duty is the minimum airflow; its final temperature still
-forces 100% immediately. Sensor faults and the hardware critical margin also
-override feedback with full speed. A 60 C target is not a guaranteed ceiling:
-sudden load changes, slow BMC reads, and fan response can cause brief overshoot.
-Observe behavior under representative load before relying on these defaults.
-Status reports `cpu_trend_c_per_second` and `cpu_predicted_c`. Omit
-`cpu_control_mode`, or set it to `"curve"`, to use the original step/linear mode.
+[`config/quanta-fan-control.predictive.json`](config/quanta-fan-control.predictive.json)
+is a starting profile matching quanta2's supplied curve: 5% at 50 C, 10% at
+60 C, 15% at 65 C, 17% at 66 C, 20% at 67 C, and immediate 100% at 68 C.
+Install it explicitly only when replacing configuration is intended:
+
+```bash
+bash scripts/install.sh --config config/quanta-fan-control.predictive.json
+```
+
+The controller samples host CPU utilization from `/proc/stat` each cycle,
+including virtual-machine CPU work. It excludes idle, iowait and steal, and
+avoids counting guest time twice. CPU utilization is an early heat hint,
+**not a measurement of power**: instruction mix, frequency and package load
+imbalance can produce different temperatures at the same utilization.
+
+The provisional load-to-duty curve is linear between these points:
+
+| Host CPU utilization | Provisional duty |
+| --- | --- |
+| 0% | 1% |
+| 25% | 8% |
+| 50% | 15% |
+| 75% | 22% |
+| 100% | 28% |
+
+Load filtering rises with a three-second time constant and releases with a
+45-second time constant. Temperature is filtered over five seconds; its
+filtered warming trend predicts ten seconds ahead. A rising-load hint adds
+bounded anticipation, and the entire prediction is capped at three degrees.
+Residual warming prediction is suppressed when raw temperature starts falling.
+The predicted temperature selects ordinary JSON curve points; prediction alone
+cannot select the final emergency point.
+
+Normal demand is the larger of the curve demand and provisional load demand,
+plus a signed, bounded learned correction. The curve remains a lower bound:
+negative correction can reduce an excessive load estimate, but cannot remove
+configured thermal airflow. Above the 59-61 C target band, while not cooling,
+correction increases by one BMC level (100/63, about 1.6 percentage points) at
+most once per 15 seconds. Prediction can trigger a correction while warming
+near the target, but stable temperature within the band does not accumulate
+error. Below 59 C for 30 seconds, while not warming and without a rising-load
+hint, correction decreases by one level at most once per 20 seconds. Correction
+is limited to +/-30 percentage points. Larger new loads discard corrections
+learned at low load. Normal output rises at most one percentage point per second
+and falls at most 0.25 per second; a long read cannot accumulate a burst of
+missed adjustments. The unrounded request is retained so BMC quantization does
+not stall small changes.
+
+Within three degrees of the full-speed endpoint, a separate raw-temperature
+guard raises demand toward 100% and permits faster acceleration. Reaching the
+configured endpoint, sensor faults, and the hardware critical margin request
+100% immediately. Emergency duty is not retained as the next normal target;
+recovery approaches normal demand using the fall limit. CPU-load read errors,
+counter resets and CPU hotplug re-establish the utilization baseline; temperature
+control continues and retains the last load estimate until a fresh sample is
+available. Configuration edits reset prediction and learned correction.
+
+Tune the following optional `predictive` object; omitted fields use defaults:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `load_curve` | Table above | `[CPU utilization %, duty %]` points spanning 0-100% |
+| `temperature_filter_seconds` | 5 | Temperature filter time constant |
+| `prediction_seconds` | 10 | Warming-trend horizon |
+| `prediction_max_c` | 3 | Maximum total prediction above filtered temperature |
+| `load_prediction_c` | 3 | Maximum rising-load anticipation |
+| `deadband_c` | 1 | Target temperature tolerance |
+| `trim_step_percent` | 100/63 | Single correction step |
+| `trim_interval_seconds` | 15 | Minimum warming correction interval |
+| `cooldown_hold_seconds` | 30 | Continuous cool condition before reducing correction |
+| `cooldown_interval_seconds` | 20 | Minimum cooling correction interval |
+| `rise_percent_per_second` | 1 | Normal output rise limit |
+| `fall_percent_per_second` | 0.25 | Normal output fall limit |
+| `max_trim_percent` | 30 | Absolute correction bound |
+
+`fall_percent_per_cycle` applies only in curve mode. The load table is an initial
+estimate, not a calibrated duty/RPM or cooling-power map. Validate steady load,
+load removal and abrupt load changes on each host; 20-30% duty is not a hard cap
+or a guarantee of a 60 C ceiling. Keep raw-temperature safety active throughout.
+
+Status preserves the shared IPMI sample and exporter hook, and adds
+`cpu_load_percent`, `cpu_load_available`, `cpu_load_filtered_percent`,
+`cpu_filtered_c`, `cpu_predicted_c`, `cpu_trend_c_per_second`,
+`cpu_curve_demand_percent`, `cpu_load_demand_percent`, `cpu_trim_percent`,
+`cpu_desired_percent`, and `cpu_controller_state`. `demand_percent` is the
+pre-slew desired duty; `target_percent` is the request sent to the BMC.
+
+For an offline decision replay, supply CSV columns
+`timestamp,temperature_c,cpu_load_percent` (increasing timestamps in seconds;
+blank load means unavailable):
+
+```bash
+python3 scripts/replay-predictive.py --config config/quanta-fan-control.predictive.json --input samples.csv > decisions.csv
+```
+
+This never accesses IPMI. Recorded temperatures reflect the old fan commands;
+replay cannot prove the thermal response of the new commands. Regression tests
+also exercise a qualitative delayed thermal model, not a calibrated host model.
+Linux documents the CPU counters in [proc_stat(5)](https://man7.org/linux/man-pages/man5/proc_stat.5.html).
 
 Missing/invalid temperatures, sensor alarms, fan faults, or CPU temperatures
 within 10°C of the hardware critical threshold request 100% duty. Startup health
