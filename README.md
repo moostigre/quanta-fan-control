@@ -185,6 +185,66 @@ replay cannot prove the thermal response of the new commands. Regression tests
 also exercise a qualitative delayed thermal model, not a calibrated host model.
 Linux documents the CPU counters in [proc_stat(5)](https://man7.org/linux/man-pages/man5/proc_stat.5.html).
 
+### Prioritized fan pairs
+
+[`config/quanta-fan-control.staged.json`](config/quanta-fan-control.staged.json)
+enables individual module control with quanta2's CPU curve and this order:
+
+| Stage | Fan modules | Activation demand |
+| --- | --- | --- |
+| Primary CPU airflow | 3 and 4 | Always available |
+| Additional airflow | 2 and 5 | Above 45%, with hysteresis and a hold |
+| Outer airflow | 1 and 6 | Above 70%, after the secondary stage |
+
+Add `"fan_staging": {"enabled": true}` to an existing CPU-only configuration
+to use these defaults. Staging is opt-in and requires `cpu_only: true`.
+`groups` contains three pairs, covering selectors 1-6 exactly once;
+`activation_percent` contains their increasing starting demands, beginning at
+zero. The predictive scalar is now CPU cooling demand, not uniform duty for
+all six modules. The primary pair gets that demand; an active later pair
+receives duty scaled from its threshold toward 100%. Secondary/outer stages
+require demand above their threshold plus three percentage points for ten
+seconds. Deactivation requires demand below threshold minus three points for
+30 seconds. Outer activation waits until the secondary stage is active.
+
+Unused pairs get `idle_percent` (default 1%, raw level 1). **Idle means minimum
+rotation, not fan stop**: quanta2's verified zero-duty experiment still produced
+roughly 4200/2900 RPM. Both rotor channels remain monitored on every module.
+The module locations and CPU-facing priority are supplied by the operator;
+selector/register mapping is recorded in the firmware inspection below.
+
+The output layer retains each module's quantized PWM rather than rewriting
+all modules each second. Normal changes wait at least five seconds and move
+at most two raw levels (about 3.2 percentage points) per update. A quarter-level
+hysteresis around quantization boundaries prevents small changes from toggling
+adjacent levels. Every 30 seconds it reasserts manual mode and the complete
+module vector to recover from a BMC reset. Only ordinary operation uses these
+holds. Within three degrees of the CPU full-speed endpoint, all pairs assist
+without staging delays or output holds; reaching the endpoint or any hardware
+fault broadcasts 100% to all modules immediately. Existing automatic-control
+cleanup and watchdog recovery remain in force.
+
+These options are configurable under `fan_staging`: `enabled`, `groups`,
+`activation_percent`, `idle_percent`, `stage_hysteresis_percent`,
+`stage_up_hold_seconds`, `stage_down_hold_seconds`, `output_hold_seconds`,
+`output_step_raw`, `output_hysteresis_raw`, and `refresh_seconds`.
+Configuration edits reset activation timers while preserving the known PWM
+outputs for gradual transitions.
+
+Status adds `fan_duty_percent` and `fan_raw`, keyed by selector, plus
+`fan_stages_active` and `fan_control_mode`. In staged mode `duty_percent` is
+the largest effective module duty, while `target_percent` is scalar CPU
+cooling demand; the RPM metrics remain per rotor. Sensor sampling and the
+shared IPMI exporter are unchanged.
+
+The 13 October stress-test metrics identified `SYS_FAN5-1` changing by
+1300-2800 RPM between samples while uniform duty stayed at 27% and faults
+remained zero. Other modules were steadier. This does not identify whether
+that rotor's cycling originates in hardware or repeated command activity.
+Staging keeps module 5 at minimum until needed; held PWM removes unnecessary
+writes. Verify RPM behavior when the secondary stage is exercised rather than
+assuming those changes repair a hardware problem.
+
 Missing/invalid temperatures, sensor alarms, fan faults, or CPU temperatures
 within 10°C of the hardware critical threshold request 100% duty. Startup health
 faults refuse activation. Runtime IPMI sensor-read errors request full speed

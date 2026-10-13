@@ -271,6 +271,50 @@ class ControllerTests(unittest.TestCase):
             self.assertIn('cpu_load_demand_percent', status)
             automatic.assert_called_once()
 
+    def test_partial_staged_write_failure_restores_automatic_control(self):
+        self.config['fan_staging'] = {'enabled': True}
+        def command(*args):
+            if args == ('mc', 'info'): return IDENTITY
+            if args[3] == '0x4': raise RuntimeError('selector write failed')
+            return ''
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(controller, 'read_config', return_value=self.config), \
+                 patch.object(controller, 'command', side_effect=command), \
+                 patch.object(controller, 'read_sensors', return_value=self.sensors), \
+                 patch.object(controller, 'core_temperatures', return_value=(55, 100)), \
+                 patch.object(controller, 'STATE', str(Path(directory) / 'status.json')), \
+                 patch.object(controller, 'automatic') as automatic, \
+                 patch.object(controller, 'notify'), patch('signal.signal'), \
+                 patch('sys.argv', ['controller']), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'selector write failed'):
+                    controller.main()
+                automatic.assert_called_once()
+
+    def test_staged_hardware_fault_commands_all_modules_full_speed(self):
+        self.config.update(cpu_control_mode='predictive', fan_staging={'enabled': True})
+        broken = copy.deepcopy(self.sensors)
+        broken['SYS_FAN2-1']['value'] = 0
+        def manual(target):
+            controller.stop = True
+            return target
+        with tempfile.TemporaryDirectory() as directory:
+            status_file = Path(directory) / 'status.json'
+            with patch.object(controller, 'read_config', return_value=self.config), \
+                 patch.object(controller, 'command', return_value=IDENTITY), \
+                 patch.object(controller, 'read_sensors', side_effect=[self.sensors, broken]), \
+                 patch.object(controller, 'core_temperatures', return_value=(40, 100)), \
+                 patch.object(controller, 'STATE', str(status_file)), \
+                 patch.object(controller, 'manual', side_effect=manual) as write, \
+                 patch.object(controller, 'automatic'), \
+                 patch.object(controller, 'notify'), patch('signal.signal'), \
+                 patch('sys.argv', ['controller']), contextlib.redirect_stdout(io.StringIO()):
+                controller.main()
+            write.assert_called_once_with(100)
+            status = json.loads(status_file.read_text())
+            self.assertTrue(status['faults'])
+            self.assertEqual(set(status['fan_duty_percent'].values()), {100})
+            self.assertEqual(set(status['fan_raw'].values()), {63})
+
 
 if __name__ == '__main__':
     unittest.main()

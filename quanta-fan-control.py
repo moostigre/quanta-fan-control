@@ -56,6 +56,57 @@ PREDICTIVE_DEFAULTS = {
     'fall_percent_per_second': .25,
     'max_trim_percent': 30,
 }
+STAGING_DEFAULTS = {
+    'enabled': False,
+    'groups': [[3, 4], [2, 5], [1, 6]],
+    'activation_percent': [0, 45, 70],
+    'idle_percent': 1,
+    'stage_hysteresis_percent': 3,
+    'stage_up_hold_seconds': 10,
+    'stage_down_hold_seconds': 30,
+    'output_hold_seconds': 5,
+    'output_step_raw': 2,
+    'output_hysteresis_raw': .25,
+    'refresh_seconds': 30,
+}
+
+def staging_options(config):
+    return dict(STAGING_DEFAULTS, **config.get('fan_staging', {}))
+
+def validate_staging(config):
+    supplied = config.get('fan_staging', {})
+    if not isinstance(supplied, dict) or set(supplied) - set(STAGING_DEFAULTS):
+        raise ValueError('fan_staging must contain supported staging options')
+    options = staging_options(config)
+    if not isinstance(options['enabled'], bool):
+        raise ValueError('fan_staging.enabled must be true or false')
+    groups = options['groups']
+    if (not isinstance(groups, list) or len(groups) != 3
+            or any(not isinstance(g, list) or len(g) != 2 for g in groups)):
+        raise ValueError('fan_staging.groups must contain three pairs')
+    selectors = [s for g in groups for s in g]
+    if (any(not isinstance(s, int) or isinstance(s, bool) for s in selectors)
+            or sorted(selectors) != list(range(1, 7))):
+        raise ValueError('fan_staging.groups must include selectors 1-6 exactly once')
+    levels = options['activation_percent']
+    if (not isinstance(levels, list) or len(levels) != 3
+            or any(not isinstance(v, (int, float)) or isinstance(v, bool)
+                   or not math.isfinite(v) for v in levels)
+            or not 0 == levels[0] < levels[1] < levels[2] < 100):
+        raise ValueError('fan_staging.activation_percent must start at 0 and increase below 100')
+    bounds = {'idle_percent': (1, 10), 'stage_hysteresis_percent': (1, 10),
+              'stage_up_hold_seconds': (5, 60), 'stage_down_hold_seconds': (15, 120),
+              'output_hold_seconds': (2, 15), 'output_step_raw': (1, 3),
+              'output_hysteresis_raw': (.1, 1), 'refresh_seconds': (15, 60)}
+    for key, (low, high) in bounds.items():
+        v = options[key]
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(v) or not low <= v <= high):
+            raise ValueError('fan_staging.' + key + ': expected %s-%s' % (low, high))
+    if not isinstance(options['output_step_raw'], int):
+        raise ValueError('fan_staging.output_step_raw must be an integer')
+    if options['enabled'] and not config.get('cpu_only', False):
+        raise ValueError('Staged CPU airflow requires cpu_only=true')
 
 def predictive_options(config):
     return dict(PREDICTIVE_DEFAULTS, **config.get('predictive', {}))
@@ -133,6 +184,7 @@ def validate_config(c):
     if resolved.get('cpu_control_mode', 'curve') not in ('curve', 'adaptive', 'predictive'):
         raise ValueError('cpu_control_mode must be curve, adaptive or predictive')
     validate_predictive(resolved)
+    validate_staging(resolved)
     if resolved.get('cpu_control_mode') in ('adaptive', 'predictive'):
         if not resolved.get('cpu_only', False):
             raise ValueError('Predictive/adaptive CPU control requires cpu_only=true')
@@ -229,6 +281,99 @@ def cooldown(target, previous, fall):
 
 def remaining_delay(started, interval):
     return max(0, started + interval - time.monotonic())
+
+class StagedFans:
+    """Allocate CPU airflow in priority order; hold quantized PWM between writes."""
+    def __init__(self):
+        self.raw = {}
+        self.changed_at = {}
+        self.refreshed_at = None
+        self.signature = None
+        self.active = [True, False, False]
+        self.up_since = [None] * 3
+        self.down_since = [None] * 3
+
+    def targets(self, options, demand, now, urgent=False):
+        idle = options['idle_percent']
+        result = {}
+        for i, (group, threshold) in enumerate(zip(options['groups'], options['activation_percent'])):
+            if i:
+                up = (demand > threshold + options['stage_hysteresis_percent']
+                      and self.active[i - 1])
+                down = demand < threshold - options['stage_hysteresis_percent']
+                self.up_since[i] = (now if self.up_since[i] is None else self.up_since[i]) if up else None
+                self.down_since[i] = (now if self.down_since[i] is None else self.down_since[i]) if down else None
+                if urgent or (self.up_since[i] is not None
+                              and now - self.up_since[i] >= options['stage_up_hold_seconds']):
+                    self.active[i] = True
+                elif (self.down_since[i] is not None
+                      and now - self.down_since[i] >= options['stage_down_hold_seconds']):
+                    self.active[i] = False
+            if i == 0:
+                value = max(idle, demand)
+            elif self.active[i]:
+                value = idle + max(0, demand - threshold) * (100 - idle) / (100 - threshold)
+            else:
+                value = idle
+            # Near the raw-temperature safety threshold, all modules assist.
+            if urgent: value = max(value, demand)
+            for selector in group: result[selector] = max(idle, value)
+        return result
+
+    def apply(self, config, demand, now, emergency=False, urgent=False):
+        options = staging_options(config)
+        signature = json.dumps(options, sort_keys=True)
+        if signature != self.signature:
+            # Reset allocation timers, retaining the known physical outputs so
+            # configuration edits do not introduce a discontinuous PWM jump.
+            self.signature = signature
+            self.active = [True, False, False]
+            self.up_since = [None] * 3
+            self.down_since = [None] * 3
+            self.refreshed_at = None
+        if emergency:
+            manual(100)  # broadcast full speed immediately; no lease or staging
+            self.raw = {i: 63 for i in range(1, 7)}
+            self.changed_at = {i: now for i in self.raw}
+            self.refreshed_at = now
+            self.active = [True] * 3
+            return {str(i): 100.0 for i in self.raw}
+        targets = self.targets(options, demand, now, urgent)
+        refresh = self.refreshed_at is None or now - self.refreshed_at >= options['refresh_seconds']
+        changes = {}
+        for i in range(1, 7):
+            desired = max(1, min(63, targets[i] * 63 / 100))
+            requested = math.ceil(desired)
+            current = self.raw.get(i)
+            if current is None or urgent:
+                candidate = requested
+            elif now - self.changed_at[i] < options['output_hold_seconds']:
+                candidate = current
+            elif requested == 1 and current > 1:
+                candidate = max(1, current - options['output_step_raw'])
+            elif desired > current + options['output_hysteresis_raw']:
+                candidate = min(requested, current + options['output_step_raw'])
+            elif desired < current - 1 - options['output_hysteresis_raw']:
+                candidate = max(requested, current - options['output_step_raw'])
+            else:
+                candidate = current
+            if candidate != current: changes[i] = candidate
+        if refresh:
+            command('raw', '0x30', '0xf9', '0xff', '0x00')
+        for i in range(1, 7):
+            if i in changes or refresh:
+                value = changes.get(i, self.raw.get(i, math.ceil(targets[i] * 63 / 100)))
+                command('raw', '0x30', '0xf9', hex(i), hex(value))
+                if i in changes:
+                    self.raw[i] = value
+                    self.changed_at[i] = now
+        if refresh: self.refreshed_at = now
+        return {str(i): round(raw * 100 / 63, 1) for i, raw in self.raw.items()}
+
+    def status(self):
+        return {'fan_raw': {str(i): v for i, v in self.raw.items()},
+                'fan_stages_active': list(self.active)}
+
 
 class CPULoad:
     """Host CPU busy time, including guests once; exclude idle, iowait and steal."""
@@ -413,6 +558,7 @@ def main():
                            time.monotonic())
     cpu_load = CPULoad()
     cpu_load.sample()  # establish counters without waiting or making BMC reads
+    staged_fans = StagedFans()
     try:
         notify('READY=1')
         while not stop:
@@ -451,11 +597,24 @@ def main():
             # Never delay rising speed; let falling speed settle gradually.
             if not predictive:
                 target = cooldown(target, previous, config['fall_percent_per_cycle'])
-            effective = manual(target); previous = target
+            if staging_options(config)['enabled']:
+                fan_duties = staged_fans.apply(config, target, time.monotonic(),
+                    emergency=bool(reasons) or cpu_max >= config['cpu_curve'][-1][0],
+                    urgent=cpu_max >= config['cpu_curve'][-1][0] - 3)
+                effective = max(fan_duties.values())
+                fan_status = staged_fans.status()
+            else:
+                effective = manual(target)
+                fan_duties = {str(i): effective for i in range(1, 7)}
+                fan_status = {'fan_stages_active': [True] * 3}
+                staged_fans = StagedFans()
+            previous = target
             status = {'timestamp':time.time(),'ipmi_read_timestamp_seconds':sensor_timestamp,
                       'ipmi_read_duration_seconds':sensor_duration,'ipmi_sensors':sensors,
                       'duty_percent':effective,'target_percent':round(target,1),
                       'demand_percent':round(demand_percent,1),
+                      'fan_duty_percent':fan_duties,
+                      'fan_control_mode':'staged' if staging_options(config)['enabled'] else 'uniform',
                       'cycle_work_seconds':round(time.monotonic()-cycle_started,3),
                       'cpu_control_mode':config.get('cpu_control_mode', 'curve'),
                       'cpu_target_c':config.get('cpu_target_c', 60),
@@ -466,6 +625,7 @@ def main():
                       'cpu_only':config.get('cpu_only', False),
                       'curve_mode':config.get('curve_mode','linear')}
             status.update(adaptive.status())
+            status.update(fan_status)
             temporary = pathlib.Path(STATE + '.tmp'); temporary.write_text(json.dumps(status,indent=2)); temporary.replace(STATE)
             exporter = '/usr/local/sbin/ipmi-metrics-5s.py'
             if pathlib.Path(exporter).is_file():
@@ -474,9 +634,9 @@ def main():
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except (OSError, subprocess.SubprocessError):
                     print('Monitoring export failed; fan control continues', flush=True)
-            event = (round(effective),tuple(reasons))
+            event = (tuple(fan_duties.items()),tuple(reasons))
             if event != last_event or time.monotonic()-last_log>60:
-                print('duty=%s%% cpu=%sC faults=%s' % (effective,max(core_max,temperatures.get('CPU0 Temp',0),temperatures.get('CPU1 Temp',0)),reasons),flush=True)
+                print('duty=%s%% fans=%s cpu=%sC faults=%s' % (effective,fan_duties,max(core_max,temperatures.get('CPU0 Temp',0),temperatures.get('CPU1 Temp',0)),reasons),flush=True)
                 last_log = time.monotonic(); last_event = event
             notify('WATCHDOG=1\nSTATUS=Fan duty %s%%; CPU %s C' % (effective,core_max))
             end = time.monotonic()+remaining_delay(cycle_started, config['interval_seconds'])
