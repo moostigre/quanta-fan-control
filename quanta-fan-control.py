@@ -59,7 +59,10 @@ PREDICTIVE_DEFAULTS = {
 STAGING_DEFAULTS = {
     'enabled': False,
     'groups': [[3, 4], [2, 5], [1, 6]],
-    'activation_percent': [0, 45, 70],
+    'activation_percent': [0, 20, 32],
+    'allocation_mode': 'balanced',
+    'balance_floor_percent': 20,
+    'priority_bias_percent': 2,
     'idle_percent': 1,
     'stage_hysteresis_percent': 3,
     'stage_up_hold_seconds': 10,
@@ -80,6 +83,8 @@ def validate_staging(config):
     options = staging_options(config)
     if not isinstance(options['enabled'], bool):
         raise ValueError('fan_staging.enabled must be true or false')
+    if options['allocation_mode'] not in ('priority', 'balanced'):
+        raise ValueError('fan_staging.allocation_mode must be priority or balanced')
     groups = options['groups']
     if (not isinstance(groups, list) or len(groups) != 3
             or any(not isinstance(g, list) or len(g) != 2 for g in groups)):
@@ -94,7 +99,8 @@ def validate_staging(config):
                    or not math.isfinite(v) for v in levels)
             or not 0 == levels[0] < levels[1] < levels[2] < 100):
         raise ValueError('fan_staging.activation_percent must start at 0 and increase below 100')
-    bounds = {'idle_percent': (1, 10), 'stage_hysteresis_percent': (1, 10),
+    bounds = {'balance_floor_percent': (1, 30), 'priority_bias_percent': (0, 5),
+              'idle_percent': (1, 10), 'stage_hysteresis_percent': (1, 10),
               'stage_up_hold_seconds': (5, 60), 'stage_down_hold_seconds': (15, 120),
               'output_hold_seconds': (2, 15), 'output_step_raw': (1, 3),
               'output_hysteresis_raw': (.1, 1), 'refresh_seconds': (15, 60)}
@@ -376,6 +382,7 @@ class StagedFans:
         self.active = [True, False, False]
         self.up_since = [None] * 3
         self.down_since = [None] * 3
+        self.allocated = {}
 
     def targets(self, options, demand, now, urgent=False):
         idle = options['idle_percent']
@@ -402,6 +409,29 @@ class StagedFans:
             # Near the raw-temperature safety threshold, all modules assist.
             if urgent: value = max(value, demand)
             for selector in group: result[selector] = max(idle, value)
+        if options['allocation_mode'] == 'balanced' and not urgent:
+            # The observed PWM dead zone is not cooling capacity: splitting
+            # 30% into two 15% requests would leave both near minimum RPM.
+            # Share only demand ABOVE that floor, keeping a small preference
+            # for the CPU-facing pair. This is an initial PWM allocation, not
+            # a calibrated airflow/RPM model; temperature feedback still wins.
+            baseline = max(idle, min(demand, options['balance_floor_percent']))
+            budget = max(0, demand - baseline)
+            active = [i for i in range(3) if self.active[i]]
+            bias = {i: options['priority_bias_percent'] * (len(active) - 1 - rank)
+                    for rank, i in enumerate(active)}
+            free = list(active)
+            extra = {i: 0 for i in active}
+            while free:
+                level = (budget - sum(bias[i] for i in free)) / len(free)
+                positive = [i for i in free if level + bias[i] > 0]
+                if positive == free:
+                    extra.update({i: level + bias[i] for i in free})
+                    break
+                free = positive
+            for i in active:
+                for selector in options['groups'][i]:
+                    result[selector] = min(100, baseline + extra[i])
         return result
 
     def apply(self, config, demand, now, emergency=False, urgent=False, overrides=None, force=()):
@@ -421,15 +451,29 @@ class StagedFans:
             self.changed_at = {i: now for i in self.raw}
             self.refreshed_at = now
             self.active = [True] * 3
+            self.allocated = {i: 100 for i in self.raw}
             return {str(i): 100.0 for i in self.raw}
         if options['enabled']:
             targets = self.targets(options, demand, now, urgent)
         else:
             targets = {i: demand for i in range(1, 7)}
             self.active = [True] * 3
+        self.allocated = dict(targets)
         for i, percent in (overrides or {}).items():
             targets[i] = max(targets[i], percent) if urgent else percent
         refresh = self.refreshed_at is None or now - self.refreshed_at >= options['refresh_seconds']
+        # Bringing helpers through a long PWM dead zone must not withdraw
+        # primary cooling first. Prime only automatic helpers to that floor;
+        # subsequent RPM-producing increments retain normal step/hold limits.
+        prime = set()
+        if options['enabled'] and options['allocation_mode'] == 'balanced' and not urgent:
+            floor_raw = math.ceil(options['balance_floor_percent'] * 63 / 100)
+            for group in options['groups'][1:]:
+                for i in group:
+                    if (i not in (overrides or {}) and i in self.raw
+                            and self.raw[i] < floor_raw
+                            and targets[i] >= options['balance_floor_percent']):
+                        prime.add(i)
         changes = {}
         for i in range(1, 7):
             desired = max(1, min(63, targets[i] * 63 / 100))
@@ -437,6 +481,8 @@ class StagedFans:
             current = self.raw.get(i)
             if current is None or urgent or i in force:
                 candidate = requested
+            elif i in prime:
+                candidate = min(requested, floor_raw)
             elif now - self.changed_at[i] < options['output_hold_seconds']:
                 candidate = current
             elif requested == 1 and current > 1:
@@ -446,6 +492,8 @@ class StagedFans:
             elif desired < current - 1 - options['output_hysteresis_raw']:
                 candidate = max(requested, current - options['output_step_raw'])
             else:
+                candidate = current
+            if prime and current is not None and candidate < current and i not in (overrides or {}):
                 candidate = current
             if candidate != current or i in force: changes[i] = candidate
         if refresh:
@@ -462,6 +510,7 @@ class StagedFans:
 
     def status(self):
         return {'fan_raw': {str(i): v for i, v in self.raw.items()},
+                'fan_allocated_percent': {str(i): round(v, 2) for i, v in self.allocated.items()},
                 'fan_stages_active': list(self.active)}
 
 
@@ -719,6 +768,7 @@ def main():
                       'cpu_control_mode':config.get('cpu_control_mode', 'curve'),
                       'cpu_target_c':config.get('cpu_target_c', 60),
                       'cpu_load_percent':round(load, 2) if load is not None else None,
+                      'cpu_max_c':cpu_max,
                       'cpu_core_max_c':core_max,'temperatures_c':temperatures,'faults':reasons,
                       'rpm':{n:sensors.get(n,{}).get('value') for n in sorted(tracked_fans)},
                       'curve_sources':config['curve_sources'],

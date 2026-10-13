@@ -82,7 +82,8 @@ def main():
         if args == ['status']:
             state = read_status()
             print(json.dumps({key: state.get(key) for key in
-                ('control_mode', 'fan_control_mode', 'manual_overrides', 'fan_duty_percent',
+                ('control_mode', 'fan_control_mode', 'cpu_max_c', 'cpu_target_c',
+                 'cpu_load_percent', 'fan_stages_active', 'manual_overrides', 'fan_duty_percent', 'rpm',
                  'manual_safety_override', 'faults')}, indent=2))
             return 0
         request = parse_command(args)

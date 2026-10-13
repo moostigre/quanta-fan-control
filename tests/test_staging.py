@@ -8,7 +8,9 @@ from test_predictive import configuration, fan
 class StagingTests(unittest.TestCase):
     def setUp(self):
         self.config = configuration()
-        self.config['fan_staging'] = {'enabled': True}
+        # Retain regression coverage for the selectable historical allocator.
+        self.config['fan_staging'] = {'enabled': True, 'allocation_mode': 'priority',
+            'activation_percent': [0, 45, 70]}
         fan.validate_config(self.config)
         self.output = fan.StagedFans()
 
@@ -120,6 +122,8 @@ class StagingTests(unittest.TestCase):
                         {'groups': [[True, 4], [2, 5], [3, 6]]},
                         {'activation_percent': [0, 70, 45]},
                         {'output_hold_seconds': 0}, {'output_step_raw': 1.5},
+                        {'allocation_mode': 'unknown'}, {'balance_floor_percent': 101},
+                        {'priority_bias_percent': -1},
                         {'idle_percent': 0}, {'refresh_seconds': float('nan')}]:
             with self.subTest(options=options):
                 config = copy.deepcopy(self.config)
@@ -155,6 +159,106 @@ class StagingTests(unittest.TestCase):
         self.assertTrue(all(v[i] == 1.6 for _, v in steady for i in ('1', '2', '5', '6')))
         self.assertLess(max(v['3'] for _, v in steady), 45)
         self.assertLess(history[-1][1]['3'], 5)
+
+class BalancedStagingTests(unittest.TestCase):
+    def setUp(self):
+        import json
+        from pathlib import Path
+        self.config = fan.validate_config(json.loads((Path(__file__).resolve().parents[1] /
+            'config/quanta-fan-control.staged.json').read_text()))
+        self.options = fan.staging_options(self.config)
+        self.output = fan.StagedFans()
+
+    def test_neighbours_join_early_and_share_excess_above_pwm_dead_zone(self):
+        self.output.targets(self.options, 30, 0)
+        targets = self.output.targets(self.options, 30, 5)
+        self.assertEqual(self.output.active, [True, True, False])
+        self.assertEqual([targets[i] for i in (3, 4, 2, 5, 1, 6)], [26, 26, 24, 24, 1, 1])
+        self.assertAlmostEqual((targets[3]-20)+(targets[2]-20), 30-20)
+
+    def test_outer_fans_assist_before_primary_pair_needs_high_duty(self):
+        for now in (0, 5, 10):
+            targets = self.output.targets(self.options, 40, now)
+        self.assertEqual(self.output.active, [True, True, True])
+        self.assertLess(targets[3], 30)
+        self.assertGreater(targets[1], 20)
+        self.assertGreater(targets[3], targets[2])
+        self.assertGreater(targets[2], targets[1])
+        self.assertAlmostEqual(sum(targets[i]-20 for i in (3, 2, 1)), 20)
+
+    def test_helpers_prime_to_dead_zone_floor_before_primary_cooling_is_reduced(self):
+        with patch.object(fan, 'command'):
+            self.output.apply(self.config, 30, 0)
+            primary = self.output.raw[3]
+            self.output.apply(self.config, 30, 5)
+            self.assertEqual(self.output.raw[3], primary)
+            self.assertEqual(self.output.raw[2], 13)
+            self.assertEqual(self.output.raw[5], 13)
+            self.output.apply(self.config, 30, 10)
+            self.assertEqual(self.output.raw[3], primary-1)
+            self.assertEqual(self.output.raw[2], 14)
+
+    def test_ordinary_rpm_changes_stay_small_and_held_after_helpers_are_primed(self):
+        with patch.object(fan, 'command'):
+            self.output.apply(self.config, 30, 0)
+            self.output.apply(self.config, 30, 5)
+            before = dict(self.output.raw)
+            self.output.apply(self.config, 40, 6)
+            for i in (2, 5):
+                self.assertEqual(self.output.raw[i], before[i])
+            for i in (3, 4):
+                self.assertLessEqual(abs(self.output.raw[i]-before[i]), 1)
+            self.output.apply(self.config, 40, 10)
+            for i in (2, 3, 4, 5):
+                self.assertLessEqual(abs(self.output.raw[i]-before[i]), 1)
+
+    def test_stage_boundary_noise_does_not_chatter_and_release_requires_a_minute(self):
+        self.output.targets(self.options, 30, 0)
+        self.output.targets(self.options, 30, 5)
+        for now in range(6, 100):
+            self.output.targets(self.options, 21 if now % 2 else 19, now)
+            self.assertTrue(self.output.active[1])
+        self.output.targets(self.options, 5, 100)
+        self.output.targets(self.options, 5, 159)
+        self.assertTrue(self.output.active[1])
+        self.output.targets(self.options, 5, 160)
+        self.assertFalse(self.output.active[1])
+
+    def test_low_demand_after_load_release_can_reach_idle(self):
+        with patch.object(fan, 'command'):
+            for now in range(0, 101):
+                self.output.apply(self.config, 40, now)
+            for now in range(101, 321):
+                self.output.apply(self.config, 1, now)
+        self.assertEqual(set(self.output.raw.values()), {1})
+        self.assertEqual(self.output.active, [True, False, False])
+
+    def test_heat_guard_and_faults_override_balancing_and_manual_settings(self):
+        with patch.object(fan, 'command') as command:
+            self.output.apply(self.config, 1, 0)
+            urgent = self.output.apply(self.config, 50, .1, urgent=True, overrides={2: 1})
+            self.assertEqual(set(urgent.values()), {50.8})
+            self.assertEqual(self.output.active, [True, True, True])
+            command.reset_mock()
+            emergency = self.output.apply(self.config, 100, .2, emergency=True, overrides={2: 1})
+            self.assertEqual(set(emergency.values()), {100})
+            self.assertEqual(command.call_count, 2)
+
+    def test_explicit_manual_helper_speed_is_not_primed_or_redistributed(self):
+        with patch.object(fan, 'command'):
+            self.output.apply(self.config, 30, 0, overrides={2: 1})
+            for now in range(1, 31):
+                self.output.apply(self.config, 30, now, overrides={2: 1})
+        self.assertEqual(self.output.raw[2], 1)
+        self.assertGreater(self.output.raw[5], 13)
+
+    def test_balanced_configuration_is_valid_with_the_alternative_cpu_pairs(self):
+        self.config['fan_staging']['groups'] = [[2, 4], [3, 5], [1, 6]]
+        fan.validate_config(self.config)
+        options = fan.staging_options(self.config)
+        self.output.targets(options, 30, 0)
+        targets = self.output.targets(options, 30, 5)
+        self.assertEqual([targets[i] for i in (2, 4, 3, 5)], [26, 26, 24, 24])
 
 
 if __name__ == '__main__':

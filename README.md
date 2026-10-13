@@ -34,8 +34,8 @@ The earlier quanta2 exporter reported zero RPM on its fan channels. The installe
 checks live BMC readings and refuses activation if a required fan is missing,
 below the configured minimum (100 RPM in the base configuration), or reports an
 alarm. Resolve the sensor/fan readings before retrying.
-The snapshot has been validated locally; installation on quanta2 has not yet
-been performed.
+Both physical hosts run the controller; deployment verifies live health and
+keeps a backup of the previous controller/configuration.
 
 ## Configuration
 
@@ -185,65 +185,106 @@ replay cannot prove the thermal response of the new commands. Regression tests
 also exercise a qualitative delayed thermal model, not a calibrated host model.
 Linux documents the CPU counters in [proc_stat(5)](https://man7.org/linux/man-pages/man5/proc_stat.5.html).
 
-### Prioritized fan pairs
+### Balanced CPU fan pairs
 
 [`config/quanta-fan-control.staged.json`](config/quanta-fan-control.staged.json)
-enables individual module control with quanta2's CPU curve and this order:
+uses early assistance and balances cooling across neighbouring modules. The
+CPU-facing order remains 3/4 first, then 2/5 (two fans per CPU), then 1/6:
 
-| Stage | Fan modules | Activation demand |
+| Stage | Fan modules | Deployed activation |
 | --- | --- | --- |
 | Primary CPU airflow | 3 and 4 | Always available |
-| Additional airflow | 2 and 5 | Above 45%, with hysteresis and a hold |
-| Outer airflow | 1 and 6 | Above 70%, after the secondary stage |
+| Neighbouring CPU airflow | 2 and 5 | Demand above 22% for 5 seconds |
+| Outer assistance | 1 and 6 | Demand above 34% for 5 seconds, after neighbours |
 
-Add `"fan_staging": {"enabled": true}` to an existing CPU-only configuration
-to use these defaults. Staging is opt-in and requires `cpu_only: true`.
-`groups` contains three pairs, covering selectors 1-6 exactly once;
-`activation_percent` contains their increasing starting demands, beginning at
-zero. The predictive scalar is now CPU cooling demand, not uniform duty for
-all six modules. The primary pair gets that demand; an active later pair
-receives duty scaled from its threshold toward 100%. Secondary/outer stages
-require demand above their threshold plus three percentage points for ten
-seconds. Deactivation requires demand below threshold minus three points for
-30 seconds. Outer activation waits until the secondary stage is active.
+The configured thresholds are `[0, 20, 32]` with two percentage points of
+hysteresis. These are scalar **cooling-demand** thresholds, not RPM percentages
+or per-fan commands. A stage releases only after demand remains below its
+threshold minus two points for 60 seconds. This engages more fans before the
+primary pair needs high RPM and avoids repeatedly switching helpers in and out.
 
-Unused pairs get `idle_percent` (default 1%, raw level 1). **Idle means minimum
-rotation, not fan stop**: quanta2's verified zero-duty experiment still produced
-roughly 4200/2900 RPM. Both rotor channels remain monitored on every module.
-The module locations and CPU-facing priority are supplied by the operator;
-selector/register mapping is recorded in the firmware inspection below.
+`allocation_mode: "balanced"` shares demand **above**
+`balance_floor_percent: 20` across active pairs. Recent quanta1 metrics showed
+little RPM increase through roughly 20% PWM, then progressively higher RPM;
+splitting a 30% request into two 15% requests would therefore leave both near
+minimum rotation. The floor is an initial hardware estimate, not a calibrated
+airflow model or fixed minimum speed. Below it, normal low demand still applies.
+`priority_bias_percent: 2` gives earlier pairs a small preference. For example,
+a sustained demand of 30% allocates about 26% to each of 3/4 and 24% to each of
+2/5; demand of 40% with all stages active allocates about 28.7%, 26.7%, and 24.7%
+to the respective pairs. Hardware rounding and held output transitions can
+produce slightly different effective values. The existing predictive temperature
+feedback continues to learn the cooling demand needed near the 60 C target.
 
-The output layer retains each module's quantized PWM rather than rewriting
-all modules each second. Normal changes wait at least five seconds and move
-at most two raw levels (about 3.2 percentage points) per update. A quarter-level
-hysteresis around quantization boundaries prevents small changes from toggling
-adjacent levels. Every 30 seconds it reasserts manual mode and the complete
-module vector to recover from a BMC reset. Only ordinary operation uses these
-holds. Within three degrees of the CPU full-speed endpoint, all pairs assist
-without staging delays or output holds; reaching the endpoint or any hardware
-fault broadcasts 100% to all modules immediately. Existing automatic-control
-cleanup and watchdog recovery remain in force.
+New helpers are primed to the estimated PWM floor before reducing existing
+cooling; RPM-producing increments then follow the normal hold/step limits.
+The deployed profile moves at most **one raw BMC level (about 1.6 percentage
+points) every five seconds** per module, except floor priming and heat/fault
+protection. Quarter-level output hysteresis suppresses quantization chatter;
+the complete output vector is refreshed every 30 seconds. Helpers below the
+activation threshold get `idle_percent` (1%, raw level 1). Idle means minimum
+rotation, not fan stop; the observed floor is roughly 4200/2900 RPM.
 
-These options are configurable under `fan_staging`: `enabled`, `groups`,
-`activation_percent`, `idle_percent`, `stage_hysteresis_percent`,
+Within three degrees of the configured full-speed endpoint, all fans assist
+without allocation delays or output holds. The endpoint or any hardware fault
+still broadcasts 100% immediately. Low RPM is an ordinary-operation goal, not
+a cap that can defeat heat protection. Manual per-fan commands remain supported;
+manual helpers are not floor-primed or redistributed, and heat protection still
+wins. Staging requires `cpu_only: true`.
+
+Options under `fan_staging`: `enabled`, `groups`, `activation_percent`,
+`allocation_mode` (`balanced` or historical `priority`), `balance_floor_percent`,
+`priority_bias_percent`, `idle_percent`, `stage_hysteresis_percent`,
 `stage_up_hold_seconds`, `stage_down_hold_seconds`, `output_hold_seconds`,
 `output_step_raw`, `output_hysteresis_raw`, and `refresh_seconds`.
-Configuration edits reset activation timers while preserving the known PWM
-outputs for gradual transitions.
+Defaults retain 10/30-second activation/release holds and two-level output steps;
+the packaged/deployed balanced profile explicitly uses the gentler settings above.
+Configuration changes preserve known outputs while resetting activation timers.
 
-Status adds `fan_duty_percent` and `fan_raw`, keyed by selector, plus
-`fan_stages_active` and `fan_control_mode`. In staged mode `duty_percent` is
-the largest effective module duty, while `target_percent` is scalar CPU
-cooling demand; the RPM metrics remain per rotor. Sensor sampling and the
-shared IPMI exporter are unchanged.
+`groups` must cover selectors 1-6 exactly once in three pairs. The installed
+mapping is `[[3,4],[2,5],[1,6]]`; `[[2,4],[3,5],[1,6]]` is also supported if a
+physical airflow test shows that order works better. Fan placement comes from
+the operator's observations; selector/register mapping is documented below.
 
-The 13 October stress-test metrics identified `SYS_FAN5-1` changing by
-1300-2800 RPM between samples while uniform duty stayed at 27% and faults
-remained zero. Other modules were steadier. This does not identify whether
-that rotor's cycling originates in hardware or repeated command activity.
-Staging keeps module 5 at minimum until needed; held PWM removes unnecessary
-writes. Verify RPM behavior when the secondary stage is exercised rather than
-assuming those changes repair a hardware problem.
+Status includes `fan_allocated_percent` (automatic targets before manual
+commands and output holds), effective `fan_duty_percent`, `fan_raw`,
+`fan_stages_active`, `cpu_max_c` and per-rotor RPM. In staged mode
+`target_percent` is scalar cooling demand; `duty_percent` is the largest effective
+module duty. `service fan control status` now includes temperatures, target,
+load, active stages and RPM for stress-test monitoring.
+
+The earlier 13 October tests also showed `SYS_FAN5-1` RPM cycling even when
+requested duty was stable. Reduced output writes and slower stage release address
+software chatter; they cannot establish or repair a hardware/BMC cause of rotor
+cycling. Check both rotor channels while testing the newly enlisted fans.
+
+### Stress testing on either physical host
+
+Run in the **Proxmox host shell**, not inside a Debian VM. Both hosts currently
+have 24 logical CPUs and `stress-ng` installed. These tests use CPU IDs 2-23 so
+two logical CPUs are excluded from the synthetic load. Stop a foreground test
+with Ctrl-C. The timeouts stop each test automatically.
+
+```bash
+service fan control set auto on
+# Moderate load, then sustained load; run sequentially.
+taskset -c 2-23 stress-ng --cpu 22 --cpu-load 50 --cpu-method matrixprod --timeout 3m --metrics-brief
+taskset -c 2-23 stress-ng --cpu 22 --cpu-load 100 --cpu-method matrixprod --timeout 10m --metrics-brief
+# Leave the machine unloaded for a few minutes to observe the slow release.
+```
+
+In a second terminal:
+
+```bash
+watch -n 2 'service fan control status'
+```
+
+Use Grafana to compare CPU temperature, RPM on fans 2/3/4/5, the outer fans, and
+faults through load start, steady load and removal. Expect neighbours to help
+before the primary pair reaches its former RPM peaks, with CPU temperatures
+settling near the target. Actual airflow and temperature response require this
+live test; unit tests verify allocation/timers/safety, not a physical thermal
+model. Review CPU IDs and worker counts after the planned CPU upgrade.
 
 Missing/invalid temperatures, sensor alarms, fan faults, or CPU temperatures
 within 10°C of the hardware critical threshold request 100% duty. Startup health
