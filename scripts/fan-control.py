@@ -16,6 +16,17 @@ import uuid
 
 RUNTIME = Path('/run/quanta-fan-control')
 
+def read_status(runtime=RUNTIME, timeout=10):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return json.loads((runtime / 'status.json').read_text())
+        except FileNotFoundError:
+            # systemd READY and socket creation precede the first sensor cycle.
+            if not (runtime / 'control.sock').exists() or time.monotonic() >= deadline:
+                raise
+            time.sleep(.1)
+
 
 def parse_command(args):
     if args == ['set', 'auto', 'on']:
@@ -69,7 +80,7 @@ def main():
     args = parser.parse_args().command
     try:
         if args == ['status']:
-            state = json.loads((RUNTIME / 'status.json').read_text())
+            state = read_status()
             print(json.dumps({key: state.get(key) for key in
                 ('control_mode', 'fan_control_mode', 'manual_overrides', 'fan_duty_percent',
                  'manual_safety_override', 'faults')}, indent=2))

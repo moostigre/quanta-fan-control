@@ -17,6 +17,18 @@ spec.loader.exec_module(cli)
 
 
 class CommandTests(unittest.TestCase):
+    def test_status_waits_for_first_reading_after_socket_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            (runtime / 'control.sock').touch()
+            def first_reading():
+                threading.Event().wait(.02)
+                (runtime / 'status.json').write_text('{"control_mode":"auto"}')
+            worker = threading.Thread(target=first_reading)
+            worker.start()
+            self.assertEqual(cli.read_status(runtime, 1), {'control_mode': 'auto'})
+            worker.join()
+
     def test_examples_and_individual_release(self):
         self.assertEqual(cli.parse_command(['set', 'fan1', '100%']),
                          {'action': 'set', 'fans': [1], 'percent': 100})
