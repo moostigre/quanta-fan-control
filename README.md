@@ -77,7 +77,66 @@ non-empty curve, in CPU/DIMM/PCH/ambient/backplane/inlet/exhaust order. Set
 highest demand wins. Temperature and fan health checks remain active in
 CPU-only mode.
 
-### Quieter compilation profile (65–70°C target)
+### Current compilation profile: 65°C with useful intermediate airflow
+
+Use [`config/quanta-fan-control.compilation.json`](config/quanta-fan-control.compilation.json).
+It replaces the quiet-load profile after a real 44-thread compilation showed
+that 8–16% PWM remained near idle RPM and delayed effective cooling until the
+75°C guard. Its target is **65°C ±1°C**, measured from the hottest core/package
+or BMC CPU sensor.
+
+On 18 October, manual supervised measurements on quanta1's CPU-facing fans
+3 and 4 gave these approximate **front-rotor** speeds:
+
+| CPU curve threshold | Requested PWM | Measured/estimated front-rotor RPM |
+| --- | --- | --- |
+| Below 50°C | 1% | 4,200 floor |
+| 50°C | 20% | near floor |
+| 55°C | 30% | 6,100–6,600 measured |
+| 60°C | 42% | approximately 9,000 |
+| 64°C | 57% | approximately 12,000 |
+| 67°C | 65% | increasing cooling |
+| 70°C | 75% | increasing cooling |
+| 74°C | 90% | increasing cooling |
+| 78°C | 100% | emergency |
+
+The calibration measured 40% at 8,500–8,700 RPM, 45% at 9,500–9,700 RPM,
+50% at 10,600–10,700 RPM, and 60% at 12,500 RPM. The 42% and 57% points
+interpolate those measurements. PWM is quantized upwards on the 1–63 scale;
+rear rotors (`-2`) run slower at the same command. These are airflow steps,
+not closed-loop RPM guarantees, and other fan modules/hosts can differ.
+
+The profile filters temperature over one second and predicts three seconds
+of warming, capped at +2°C. The load estimate spans 1–42% PWM and correction
+is bounded to ±10 percentage points. Priority allocation keeps the primary
+pair's requested speed when neighbours join (thresholds 30% and 50%); it does
+not split a demand of 57% into several low-PWM requests. Neighbours still
+join after five seconds of sustained demand.
+
+`fan_staging.rise_floor_percent: 30` bypasses ineffective PWM values when
+rising demand reaches that floor, both in scalar demand and physical outputs.
+It never exceeds current thermal demand or alters explicit manual commands.
+Above that floor, upward steps are limited to three raw levels each second;
+normal demand rises at up to five percentage points per second. Downward
+limits remain two percentage points per second and three raw levels every
+two seconds. Existing profiles default to a 1% rise floor and retain their
+previous behavior. Sensor-fault, hardware-critical-margin and 78°C emergency
+protection remain active; the urgent guard remains 75°C.
+
+```bash
+bash scripts/install.sh --config config/quanta-fan-control.compilation.json
+```
+
+A bounded 120-second, 44-thread SHA-256 load on quanta1 exercised the real
+controller and fans. Cores peaked at 67°C and settled around 63–65°C; the hotter
+BMC input peaked at 71°C. Primary front rotors briefly reached about 16,000 RPM
+without an emergency/full-speed command. About 50 seconds after load ended,
+the hottest CPU input was 51°C and the primary fan was approximately 4,300 RPM.
+This validates a sustained synthetic workload and cooldown, not every compiler
+instruction mix or room temperature. Quanta1 uses this profile; quanta2 retains
+its existing configuration unless explicitly selected.
+
+### Historical quiet-load profile (superseded for compilation)
 
 [`config/quanta-fan-control.quiet-load.json`](config/quanta-fan-control.quiet-load.json)
 targets **67°C with a ±2°C band**, using the hottest core/package or BMC CPU
@@ -261,7 +320,7 @@ feedback continues to learn the cooling demand needed near the 60 C target.
 
 New helpers are primed to the estimated PWM floor before reducing existing
 cooling; RPM-producing increments then follow the normal hold/step limits.
-The deployed profile moves at most **one raw BMC level (about 1.6 percentage
+The balanced profile moves at most **one raw BMC level (about 1.6 percentage
 points) every five seconds** per module, except floor priming and heat/fault
 protection. Quarter-level output hysteresis suppresses quantization chatter;
 the complete output vector is refreshed every 30 seconds. Helpers below the
@@ -279,7 +338,7 @@ Options under `fan_staging`: `enabled`, `groups`, `activation_percent`,
 `allocation_mode` (`balanced` or historical `priority`), `balance_floor_percent`,
 `priority_bias_percent`, `idle_percent`, `stage_hysteresis_percent`,
 `stage_up_hold_seconds`, `stage_down_hold_seconds`, `output_hold_seconds`,
-`output_step_raw`, `output_hysteresis_raw`, and `refresh_seconds`.
+`output_step_raw`, `output_hysteresis_raw`, `rise_floor_percent`, and `refresh_seconds`.
 Defaults retain 10/30-second activation/release holds and two-level output steps;
 the packaged/deployed balanced profile explicitly uses the gentler settings above.
 Configuration changes preserve known outputs while resetting activation timers.

@@ -69,6 +69,7 @@ STAGING_DEFAULTS = {
     'stage_up_hold_seconds': 10,
     'stage_down_hold_seconds': 30,
     'output_hold_seconds': 5,
+    'rise_floor_percent': 1,
     'output_step_raw': 2,
     'output_fall_hold_seconds': 5,
     'output_fall_step_raw': 2,
@@ -111,7 +112,8 @@ def validate_staging(config):
     bounds = {'balance_floor_percent': (1, 30), 'priority_bias_percent': (0, 5),
               'idle_percent': (1, 10), 'stage_hysteresis_percent': (1, 10),
               'stage_up_hold_seconds': (5, 60), 'stage_down_hold_seconds': (15, 120),
-              'output_hold_seconds': (2, 15), 'output_step_raw': (1, 3),
+              'output_hold_seconds': (1, 15), 'output_step_raw': (1, 3),
+              'rise_floor_percent': (1, 40),
               'output_fall_hold_seconds': (1, 15), 'output_fall_step_raw': (1, 6),
               'output_hysteresis_raw': (.1, 1), 'refresh_seconds': (15, 60)}
     for key, (low, high) in bounds.items():
@@ -476,7 +478,7 @@ class StagedFans:
         # Bringing helpers through a long PWM dead zone must not withdraw
         # primary cooling first. Prime only automatic helpers to that floor;
         # subsequent RPM-producing increments retain normal step/hold limits.
-        prime = set()
+        prime = {}
         if options['enabled'] and options['allocation_mode'] == 'balanced' and not urgent:
             floor_raw = math.ceil(options['balance_floor_percent'] * 63 / 100)
             for group in options['groups'][1:]:
@@ -484,7 +486,16 @@ class StagedFans:
                     if (i not in (overrides or {}) and i in self.raw
                             and self.raw[i] < floor_raw
                             and targets[i] >= options['balance_floor_percent']):
-                        prime.add(i)
+                        prime[i] = floor_raw
+        # Jump only through the calibrated low-PWM dead zone. Ordinary RPM
+        # increments above this floor still use the per-fan step/hold limits.
+        if options['enabled'] and not urgent:
+            floor = options['rise_floor_percent']
+            floor_raw = math.ceil(floor * 63 / 100)
+            for i in range(1, 7):
+                if (i not in (overrides or {}) and i in self.raw
+                        and self.raw[i] < floor_raw and targets[i] >= floor):
+                    prime[i] = max(prime.get(i, 1), floor_raw)
         changes = {}
         for i in range(1, 7):
             desired = max(1, min(63, targets[i] * 63 / 100))
@@ -493,7 +504,7 @@ class StagedFans:
             if current is None or urgent or i in force:
                 candidate = requested
             elif i in prime:
-                candidate = min(requested, floor_raw)
+                candidate = min(requested, prime[i])
             elif now - self.changed_at[i] < (options['output_fall_hold_seconds']
                     if requested < current else options['output_hold_seconds']):
                 candidate = current
@@ -671,8 +682,14 @@ class AdaptiveCPU:
             self.desired = max(self.desired, 100 * (temperature - full_speed + 3) / 3)
             rise = max(rise, 10)
             self.state = 'high_temperature'
-        return min(previous + rise * slew_time,
-                   max(self.desired, previous - options['fall_percent_per_second'] * slew_time))
+        output = min(previous + rise * slew_time,
+                     max(self.desired, previous - options['fall_percent_per_second'] * slew_time))
+        staging = staging_options(config)
+        if (staging['enabled'] and previous < staging['rise_floor_percent'] <= self.desired):
+            # Avoid spending seconds ramping through commands that do not
+            # raise RPM. Never exceed the currently requested thermal airflow.
+            output = max(output, staging['rise_floor_percent'])
+        return output
 
     def status(self):
         return {'cpu_filtered_c': round(self.filtered, 2),
