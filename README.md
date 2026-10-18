@@ -91,14 +91,18 @@ On 18 October, manual supervised measurements on quanta1's CPU-facing fans
 | CPU curve threshold | Requested PWM | Measured/estimated front-rotor RPM |
 | --- | --- | --- |
 | Below 50°C | 1% | 4,200 floor |
-| 50°C | 20% | near floor |
-| 55°C | 30% | 6,100–6,600 measured |
-| 60°C | 42% | approximately 9,000 |
-| 64°C | 57% | approximately 12,000 |
-| 67°C | 65% | increasing cooling |
-| 70°C | 75% | increasing cooling |
-| 74°C | 90% | increasing cooling |
-| 78°C | 100% | emergency |
+| 55°C | 20% | near minimum |
+| 60°C | 30% | approximately 6,000 |
+| 70°C | 42% | approximately 9,000 |
+| 75°C | 57% | approximately 12,000 |
+| 76°C | 65% | increasing cooling |
+| 77°C | 75% | increasing cooling |
+| 78°C | 90% | increasing cooling |
+| 79°C | 100% | emergency |
+
+Step mode holds 1% through 50–54°C until the first listed threshold at 55°C.
+These are the requested base curve points; the existing predictive/load/trim
+adjustments and fan allocation still apply. The 65°C feedback target is retained.
 
 The calibration measured 40% at 8,500–8,700 RPM, 45% at 9,500–9,700 RPM,
 50% at 10,600–10,700 RPM, and 60% at 12,500 RPM. The 42% and 57% points
@@ -120,15 +124,16 @@ Above that floor, upward steps are limited to three raw levels each second;
 normal demand rises at up to five percentage points per second. Downward
 limits remain two percentage points per second and three raw levels every
 two seconds. Existing profiles default to a 1% rise floor and retain their
-previous behavior. Sensor-fault, hardware-critical-margin and 78°C emergency
-protection remain active; the urgent guard remains 75°C.
+previous behavior. Sensor-fault, hardware-critical-margin and 79°C emergency
+protection remain active; the urgent guard now begins at 76°C.
 
 ```bash
 bash scripts/install.sh --config config/quanta-fan-control.compilation.json
 ```
 
-A bounded 120-second, 44-thread SHA-256 load on quanta1 exercised the real
-controller and fans. Cores peaked at 67°C and settled around 63–65°C; the hotter
+Before the temperature thresholds above were revised, a bounded 120-second,
+44-thread SHA-256 load on quanta1 exercised the controller and fans with the
+previous 55/60/64°C airflow thresholds. Cores peaked at 67°C and settled around 63–65°C; the hotter
 BMC input peaked at 71°C. Primary front rotors briefly reached about 16,000 RPM
 without an emergency/full-speed command. About 50 seconds after load ended,
 the hottest CPU input was 51°C and the primary fan was approximately 4,300 RPM.
