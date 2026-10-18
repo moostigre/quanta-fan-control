@@ -138,8 +138,7 @@ BMC input peaked at 71°C. Primary front rotors briefly reached about 16,000 RPM
 without an emergency/full-speed command. About 50 seconds after load ended,
 the hottest CPU input was 51°C and the primary fan was approximately 4,300 RPM.
 This validates a sustained synthetic workload and cooldown, not every compiler
-instruction mix or room temperature. Quanta1 uses this profile; quanta2 retains
-its existing configuration unless explicitly selected.
+instruction mix or room temperature. Both quanta1 and quanta2 use this profile.
 
 ### Historical quiet-load profile (superseded for compilation)
 
