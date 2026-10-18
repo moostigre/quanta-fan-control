@@ -91,8 +91,8 @@ On 18 October, manual supervised measurements on quanta1's CPU-facing fans
 | CPU curve threshold | Requested PWM | Measured/estimated front-rotor RPM |
 | --- | --- | --- |
 | Below 50°C | 1% | 4,200 floor |
-| 55°C | 20% | near minimum |
-| 60°C | 30% | approximately 6,000 |
+| 60°C | 20% | near minimum |
+| 65°C | 30% | approximately 6,000 |
 | 70°C | 42% | approximately 9,000 |
 | 75°C | 57% | approximately 12,000 |
 | 76°C | 65% | increasing cooling |
@@ -100,7 +100,7 @@ On 18 October, manual supervised measurements on quanta1's CPU-facing fans
 | 78°C | 90% | increasing cooling |
 | 79°C | 100% | emergency |
 
-Step mode holds 1% through 50–54°C until the first listed threshold at 55°C.
+Step mode holds 1% through 50–59°C until the first listed threshold at 60°C.
 These are the requested base curve points; the existing predictive/load/trim
 adjustments and fan allocation still apply. The 65°C feedback target is retained.
 

@@ -11,8 +11,8 @@ class CompilationTests(unittest.TestCase):
             (ROOT/'config/quanta-fan-control.compilation.json').read_text()))
 
     def test_requested_temperature_steps(self):
-        for temperature, duty in ((0,1),(49.9,1),(50,1),(54.9,1),(55,20),
-                                  (59.9,20),(60,30),(69.9,30),(70,42),
+        for temperature, duty in ((0,1),(49.9,1),(50,1),(59.9,1),(60,20),
+                                  (64.9,20),(65,30),(69.9,30),(70,42),
                                   (74.9,42),(75,57),(76,65),(77,75),
                                   (78,90),(78.9,90),(79,100),(80,100)):
             with self.subTest(temperature=temperature):
@@ -20,7 +20,7 @@ class CompilationTests(unittest.TestCase):
                                                 self.config['curve_mode']),duty)
 
     def test_measured_airflow_points_are_reached_before_the_heat_guard(self):
-        for temperature, raw in ((60,19),(70,27),(75,36)):
+        for temperature, raw in ((65,19),(70,27),(75,36)):
             control, output = fan.AdaptiveCPU(temperature,0), fan.StagedFans()
             duty=1
             with patch.object(fan,'command'):
@@ -34,10 +34,10 @@ class CompilationTests(unittest.TestCase):
             self.assertLess(max(output.raw.values()),63)
 
     def test_cold_start_crosses_dead_zone_immediately_then_keeps_small_rpm_steps(self):
-        control,output=fan.AdaptiveCPU(60,0),fan.StagedFans()
+        control,output=fan.AdaptiveCPU(65,0),fan.StagedFans()
         with patch.object(fan,'command'):
             output.apply(self.config,1,0)
-            duty=control.update(self.config,60,1,1,0)
+            duty=control.update(self.config,65,1,1,0)
             self.assertEqual(duty,30)
             output.apply(self.config,duty,1)
             self.assertEqual(output.raw[3],19)
@@ -78,12 +78,12 @@ class CompilationTests(unittest.TestCase):
         self.assertEqual(output.raw[4],36)
 
     def test_floor_cannot_exceed_current_thermal_demand(self):
-        control,output=fan.AdaptiveCPU(55,0),fan.StagedFans()
+        control,output=fan.AdaptiveCPU(60,0),fan.StagedFans()
         duty=1
         with patch.object(fan,'command'):
             output.apply(self.config,duty,0)
             for now in range(1,16):
-                duty=control.update(self.config,55,duty,now,0)
+                duty=control.update(self.config,60,duty,now,0)
                 output.apply(self.config,duty,now)
         self.assertEqual(duty,20)
         self.assertEqual(output.raw[3],13)
