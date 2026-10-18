@@ -82,8 +82,8 @@ CPU-only mode.
 Use [`config/quanta-fan-control.compilation.json`](config/quanta-fan-control.compilation.json).
 It replaces the quiet-load profile after a real 44-thread compilation showed
 that 8–16% PWM remained near idle RPM and delayed effective cooling until the
-75°C guard. Its target is **65°C ±1°C**, measured from the hottest core/package
-or BMC CPU sensor.
+75°C guard. Its target is **65°C ±1°C**, measured from the arithmetic mean of all
+core/package readings and the two BMC CPU sensors (`cpu_temperature_mode: "average"`).
 
 On 18 October, manual supervised measurements on quanta1's CPU-facing fans
 3 and 4 gave these approximate **front-rotor** speeds:
@@ -103,6 +103,19 @@ On 18 October, manual supervised measurements on quanta1's CPU-facing fans
 Step mode holds 1% through 50–59°C until the first listed threshold at 60°C.
 These are the requested base curve points; the existing predictive/load/trim
 adjustments and fan allocation still apply. The 65°C feedback target is retained.
+
+Every core/package `coretemp` input and each BMC CPU reading has equal weight.
+RAM/DIMM, inlet, exhaust and other non-CPU sensors are excluded from this mean.
+The average drives normal curves, forecasts and temperature feedback. A brief
+70°C spike on one otherwise cool core therefore does not select the 70°C step.
+Existing profiles without `cpu_temperature_mode` retain the historical `"max"`
+behavior; the setting also accepts `"average"`.
+
+Safety still uses the hottest raw CPU reading: the 76–79°C near-emergency guard,
+79°C full-speed endpoint, and hardware-critical-minus-10°C override cannot be
+hidden by averaging. Missing sensors and alarms still force protective behavior.
+Status/CLI expose `cpu_average_c` and `cpu_control_c` beside `cpu_max_c` and
+`cpu_core_max_c`, so both normal control and safety inputs remain visible.
 
 The calibration measured 40% at 8,500–8,700 RPM, 45% at 9,500–9,700 RPM,
 50% at 10,600–10,700 RPM, and 60% at 12,500 RPM. The 42% and 57% points

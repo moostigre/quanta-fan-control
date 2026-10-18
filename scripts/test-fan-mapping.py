@@ -40,7 +40,7 @@ def main():
 
     def sample(phase):
         sensors = controller.read_sensors()
-        core, critical = controller.core_temperatures()
+        core, critical, _ = controller.core_temperatures()
         fans = {n: s['value'] for n, s in sensors.items() if n.startswith('SYS_FAN')}
         temps = {n: s['value'] for n, s in sensors.items() if s['unit'] == 'degrees C' and s['value'] is not None}
         samples.append({'time': time.time(), 'phase': phase, 'core_max_c': core,

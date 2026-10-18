@@ -150,7 +150,7 @@ class ControllerTests(unittest.TestCase):
             with patch.object(controller, 'CONFIG', str(config)), patch('sys.argv', ['controller', '--check']), \
                  patch.object(controller, 'command', return_value=IDENTITY) as command, \
                  patch.object(controller, 'read_sensors', return_value=self.sensors), \
-                 patch.object(controller, 'core_temperatures', return_value=(55, 100)), \
+                 patch.object(controller, 'core_temperatures', return_value=(55, 100, [55])), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
                 controller.main()
                 self.assertTrue(json.loads(output.getvalue())['faults'])
@@ -203,7 +203,7 @@ class ControllerTests(unittest.TestCase):
             with patch.object(controller, 'read_config', return_value=self.config), \
                  patch.object(controller, 'command', return_value=IDENTITY), \
                  patch.object(controller, 'read_sensors', return_value=self.sensors), \
-                 patch.object(controller, 'core_temperatures', return_value=(55, 100)), \
+                 patch.object(controller, 'core_temperatures', return_value=(55, 100, [55])), \
                  patch.object(controller, 'STATE', str(Path(directory) / 'status.json')), \
                  patch.object(controller, 'manual', side_effect=RuntimeError('write failed')), \
                  patch.object(controller, 'automatic') as automatic, \
@@ -226,7 +226,7 @@ class ControllerTests(unittest.TestCase):
                  patch.object(controller, 'command', return_value=IDENTITY), \
                  patch.object(controller, 'read_sensors', side_effect=[
                      self.sensors, controller.subprocess.TimeoutExpired('ipmitool', 8), self.sensors]), \
-                 patch.object(controller, 'core_temperatures', return_value=(40, 100)), \
+                 patch.object(controller, 'core_temperatures', return_value=(40, 100, [40])), \
                  patch.object(controller, 'STATE', str(Path(directory) / 'status.json')), \
                  patch.object(controller, 'manual', side_effect=manual), \
                  patch.object(controller, 'automatic') as automatic, \
@@ -251,7 +251,7 @@ class ControllerTests(unittest.TestCase):
                  patch.object(controller, 'command', return_value=IDENTITY), \
                  patch.object(controller, 'read_sensors', side_effect=[self.sensors,
                      controller.subprocess.TimeoutExpired('ipmitool', 8), self.sensors]), \
-                 patch.object(controller, 'core_temperatures', return_value=(40, 100)), \
+                 patch.object(controller, 'core_temperatures', return_value=(40, 100, [40])), \
                  patch.object(controller, 'STATE', str(status_file)), \
                  patch.object(controller, 'manual', side_effect=manual), \
                  patch.object(controller, 'automatic') as automatic, \
@@ -281,7 +281,7 @@ class ControllerTests(unittest.TestCase):
             with patch.object(controller, 'read_config', return_value=self.config), \
                  patch.object(controller, 'command', side_effect=command), \
                  patch.object(controller, 'read_sensors', return_value=self.sensors), \
-                 patch.object(controller, 'core_temperatures', return_value=(55, 100)), \
+                 patch.object(controller, 'core_temperatures', return_value=(55, 100, [55])), \
                  patch.object(controller, 'STATE', str(Path(directory) / 'status.json')), \
                  patch.object(controller, 'automatic') as automatic, \
                  patch.object(controller, 'notify'), patch('signal.signal'), \
@@ -302,7 +302,7 @@ class ControllerTests(unittest.TestCase):
             with patch.object(controller, 'read_config', return_value=self.config), \
                  patch.object(controller, 'command', return_value=IDENTITY), \
                  patch.object(controller, 'read_sensors', side_effect=[self.sensors, broken]), \
-                 patch.object(controller, 'core_temperatures', return_value=(40, 100)), \
+                 patch.object(controller, 'core_temperatures', return_value=(40, 100, [40])), \
                  patch.object(controller, 'STATE', str(status_file)), \
                  patch.object(controller, 'manual', side_effect=manual) as write, \
                  patch.object(controller, 'automatic'), \

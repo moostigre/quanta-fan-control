@@ -2,7 +2,9 @@
 """Replay recorded temperatures/load without accessing hardware.
 
 Input CSV: timestamp,temperature_c,cpu_load_percent (blank load is unavailable).
-Timestamps are increasing seconds; temperatures must be the hottest CPU input.
+Timestamps are increasing seconds; temperatures must be the configured CPU
+control input (hottest or average). This single-input replay does not model
+the independent peak-temperature safety overrides used by average mode.
 This checks decisions against fixed observations, not the counterfactual heat
 response that different fan commands would have produced.
 """

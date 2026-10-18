@@ -3,7 +3,8 @@
 Config points are [temperature C, duty percent]. Highest thermal demand wins.
 Empty lists inherit the first non-empty curve in CURVE_KEYS order (CPU first).
 With cpu_only=true only CPU inputs determine normal duty; predictive/adaptive
-mode also anticipates heating from local CPU utilization.
+mode also anticipates heating from local CPU utilization. Normal control can
+use the mean of CPU readings; peak CPU temperatures retain safety overrides.
 With curve_mode=step each speed is held until the next temperature threshold.
 On normal exit and systemd watchdog failure, return to native BMC control.
 A host-wide freeze cannot be covered by a userspace/systemd watchdog.
@@ -202,6 +203,8 @@ def validate_config(c):
         raise ValueError('curve_mode must be linear or step')
     if resolved.get('cpu_control_mode', 'curve') not in ('curve', 'adaptive', 'predictive'):
         raise ValueError('cpu_control_mode must be curve, adaptive or predictive')
+    if resolved.get('cpu_temperature_mode', 'max') not in ('max', 'average'):
+        raise ValueError('cpu_temperature_mode must be max or average')
     validate_predictive(resolved)
     validate_staging(resolved)
     if resolved.get('cpu_control_mode') in ('adaptive', 'predictive'):
@@ -254,15 +257,34 @@ def core_temperatures():
     for name in glob.glob('/sys/class/hwmon/hwmon*/name'):
         if pathlib.Path(name).read_text().strip() != 'coretemp': continue
         devices += 1
-        for p in pathlib.Path(name).parent.glob('temp*_input'):
-            values.append(float(p.read_text()) / 1000)
+        inputs = list(pathlib.Path(name).parent.glob('temp*_input'))
+        if not inputs:
+            raise RuntimeError('Both CPUs require temperature readings')
+        for p in inputs:
+            value = float(p.read_text()) / 1000
+            if not math.isfinite(value) or not 0 <= value <= 120:
+                raise RuntimeError('Invalid CPU temperature: ' + str(p))
+            values.append(value)
         for p in pathlib.Path(name).parent.glob('temp*_crit'):
-            critical.append(float(p.read_text()) / 1000)
+            limit = float(p.read_text()) / 1000
+            if not math.isfinite(limit) or not 0 < limit <= 120:
+                raise RuntimeError('Invalid CPU critical temperature: ' + str(p))
+            critical.append(limit)
     if devices != 2 or not values or not critical:
         raise RuntimeError('Both CPU coretemp devices are required')
-    return max(values), min(critical)
+    return max(values), min(critical), values
 
-def demand(config, sensors, core_max, core_critical, tracked_fans, tracked_temps):
+def cpu_temperature_summary(config, core_values, temperatures):
+    # Equal weight for every core/package input and each BMC CPU reading.
+    # DIMM, inlet, exhaust and other non-CPU sensors never dilute this mean.
+    values = list(core_values) + [temperatures[name] for name in ('CPU0 Temp', 'CPU1 Temp')
+                                 if name in temperatures]
+    maximum, average = max(values), math.fsum(values) / len(values)
+    mode = config.get('cpu_temperature_mode', 'max')
+    return maximum, average, average if mode == 'average' else maximum
+
+def demand(config, sensors, core_max, core_critical, tracked_fans, tracked_temps,
+           core_values=None):
     reasons, temps = [], {}
     for name in tracked_temps:
         s = sensors.get(name, {})
@@ -281,7 +303,9 @@ def demand(config, sensors, core_max, core_critical, tracked_fans, tracked_temps
     if reasons: return 100, reasons, temps
     cpu = max(core_max, temps['CPU0 Temp'], temps['CPU1 Temp'])
     mode = config.get('curve_mode', 'linear')
-    cpu_target = interpolate(config['cpu_curve'], cpu, mode)
+    cpu_control = cpu_temperature_summary(config, core_values, temps)[2] if core_values is not None else cpu
+    cpu_target = (100 if cpu >= config['cpu_curve'][-1][0] else
+                  interpolate(config['cpu_curve'], cpu_control, mode))
     if config.get('cpu_only', False): return cpu_target, [], temps
     targets = [cpu_target]
     mapping = {'PCH Temp':'pch_curve', 'Ambient_Temp':'ambient_curve',
@@ -592,6 +616,7 @@ class AdaptiveCPU:
     def update(self, config, temperature, previous, now, load=None, learn=True):
         options = predictive_options(config)
         signature = json.dumps([config['cpu_curve'], config.get('curve_mode', 'linear'),
+                                config.get('cpu_temperature_mode', 'max'),
                                 config.get('cpu_target_c', 60), options], sort_keys=True)
         if self.signature is not None and signature != self.signature:
             self.__init__(temperature, now)
@@ -718,16 +743,16 @@ def main():
     sensors = read_sensors()
     tracked_fans = set(config['required_fans']) | {n for n,s in sensors.items() if s['unit']=='RPM' and n.startswith('SYS_FAN') and (s['value'] or 0)>0}
     tracked_temps = {'CPU0 Temp','CPU1 Temp','PCH Temp','Ambient_Temp','BP_Temp','Inlet_Temp','Exhaust_Temp'} | {n for n,s in sensors.items() if n.startswith('Temp_DIMM_') and s['value'] is not None}
-    core_max, core_critical = core_temperatures()
-    target, reasons, temperatures = demand(config,sensors,core_max,core_critical,tracked_fans,tracked_temps)
+    core_max, core_critical, core_values = core_temperatures()
+    target, reasons, temperatures = demand(config,sensors,core_max,core_critical,tracked_fans,tracked_temps, core_values)
+    cpu_max, cpu_average, cpu_control = cpu_temperature_summary(config, core_values, temperatures)
     if args.check:
-        print(json.dumps({'target_percent':round(target,1),'faults':reasons,'core_max_c':core_max,'temperatures_c':temperatures,'monitored_fans':sorted(tracked_fans),'curve_sources':config['curve_sources'],'cpu_only':config.get('cpu_only', False),'curve_mode':config.get('curve_mode','linear')},indent=2)); return
+        print(json.dumps({'target_percent':round(target,1),'faults':reasons,'core_max_c':core_max,'cpu_average_c':round(cpu_average, 2),'cpu_control_c':round(cpu_control, 2),'cpu_temperature_mode':config.get('cpu_temperature_mode', 'max'),'temperatures_c':temperatures,'monitored_fans':sorted(tracked_fans),'curve_sources':config['curve_sources'],'cpu_only':config.get('cpu_only', False),'curve_mode':config.get('curve_mode','linear')},indent=2)); return
     if reasons: raise RuntimeError('Initial health check failed: ' + '; '.join(reasons))
     signal.signal(signal.SIGTERM,on_signal); signal.signal(signal.SIGINT,on_signal)
     pathlib.Path(STATE).parent.mkdir(parents=True,exist_ok=True)
     previous, last_log, last_event = target, 0, None
-    adaptive = AdaptiveCPU(max(core_max, temperatures['CPU0 Temp'], temperatures['CPU1 Temp']),
-                           time.monotonic())
+    adaptive = AdaptiveCPU(cpu_control, time.monotonic())
     cpu_load = CPULoad()
     cpu_load.sample()  # establish counters without waiting or making BMC reads
     staged_fans = StagedFans()
@@ -754,27 +779,37 @@ def main():
             # Remember any additional fans/DIMMs reconnected during this run.
             tracked_fans.update(n for n,s in sensors.items() if n.startswith('SYS_FAN') and (s['value'] or 0)>0)
             tracked_temps.update(n for n,s in sensors.items() if n.startswith('Temp_DIMM_') and s['value'] is not None)
-            core_max, core_critical = core_temperatures()
-            target,reasons,temperatures = demand(config,sensors,core_max,core_critical,tracked_fans,tracked_temps)
+            core_max, core_critical, core_values = core_temperatures()
+            target,reasons,temperatures = demand(config,sensors,core_max,core_critical,tracked_fans,tracked_temps, core_values)
             if read_error:
                 reasons.append('sensor read failed: ' + read_error)
-            cpu_max = max(core_max, temperatures.get('CPU0 Temp', 0), temperatures.get('CPU1 Temp', 0))
+            cpu_max, cpu_average, cpu_control = cpu_temperature_summary(config, core_values, temperatures)
             load = cpu_load.sample()
             predictive = config.get('cpu_control_mode', 'curve') in ('adaptive', 'predictive')
             if predictive and not reasons:
-                target = adaptive.update(config, cpu_max, previous, time.monotonic(), load,
+                target = adaptive.update(config, cpu_control, previous, time.monotonic(), load,
                                          learn=not control.overrides)
             else:
-                adaptive = AdaptiveCPU(cpu_max, time.monotonic())
+                adaptive = AdaptiveCPU(cpu_control, time.monotonic())
                 adaptive.state = 'fault' if reasons else 'curve'
                 adaptive.desired = target
                 adaptive.load_available = load is not None
-            demand_percent = adaptive.desired if predictive and not reasons else target
-            # Never delay rising speed; let falling speed settle gradually.
-            if not predictive:
-                target = cooldown(target, previous, config['fall_percent_per_cycle'])
             emergency = bool(reasons) or cpu_max >= config['cpu_curve'][-1][0]
             urgent = cpu_max >= config['cpu_curve'][-1][0] - 3
+            if emergency:
+                target = 100
+                adaptive.state, adaptive.desired = ('fault' if reasons else 'emergency'), 100
+            elif urgent:
+                # Averages govern ordinary airflow; the hottest raw CPU still
+                # supplies the near-emergency guard independently of the mean.
+                guard = 100 * (cpu_max - config['cpu_curve'][-1][0] + 3) / 3
+                target = max(target, guard)
+                adaptive.desired = max(adaptive.desired, guard)
+                adaptive.state = 'high_temperature'
+            demand_percent = adaptive.desired if predictive and not reasons else target
+            # Never delay rising speed; let falling speed settle gradually.
+            if not predictive and not emergency:
+                target = cooldown(target, previous, config['fall_percent_per_cycle'])
             if staging_options(config)['enabled'] or control.overrides or force:
                 fan_duties = staged_fans.apply(config, target, time.monotonic(),
                     emergency=emergency, urgent=urgent,
@@ -802,6 +837,9 @@ def main():
                       'cpu_target_c':config.get('cpu_target_c', 60),
                       'cpu_load_percent':round(load, 2) if load is not None else None,
                       'cpu_max_c':cpu_max,
+                      'cpu_average_c':round(cpu_average, 2),
+                      'cpu_control_c':round(cpu_control, 2),
+                      'cpu_temperature_mode':config.get('cpu_temperature_mode', 'max'),
                       'cpu_core_max_c':core_max,'temperatures_c':temperatures,'faults':reasons,
                       'rpm':{n:sensors.get(n,{}).get('value') for n in sorted(tracked_fans)},
                       'curve_sources':config['curve_sources'],
