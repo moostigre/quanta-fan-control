@@ -195,8 +195,8 @@ def validate_config(c):
     for key in CURVE_KEYS:
         resolved[key] = [list(point) for point in (c[key] or first)]
     resolved['curve_sources'] = {key: key if c[key] else first_key for key in CURVE_KEYS}
-    if resolved['cpu_curve'][-1][0] > 80:
-        raise ValueError('CPU full-speed point must be <=80 C, including inherited curves')
+    if resolved['cpu_curve'][-1][0] > 85:
+        raise ValueError('CPU full-speed point must be <=85 C, including inherited curves')
     if not isinstance(resolved.get('cpu_only', False), bool):
         raise ValueError('cpu_only must be true or false')
     if resolved.get('curve_mode', 'linear') not in ('linear', 'step'):

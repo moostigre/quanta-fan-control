@@ -12,15 +12,15 @@ class CompilationTests(unittest.TestCase):
 
     def test_requested_temperature_steps(self):
         for temperature, duty in ((0,1),(49.9,1),(50,1),(59.9,1),(60,20),
-                                  (64.9,20),(65,30),(69.9,30),(70,42),
-                                  (74.9,42),(75,57),(76,65),(77,75),
-                                  (78,90),(78.9,90),(79,100),(80,100)):
+                                  (65,20),(69.9,20),(70,30),(77.9,30),
+                                  (78,42),(79.9,42),(80,57),(84.9,57),
+                                  (85,100),(86,100)):
             with self.subTest(temperature=temperature):
                 self.assertEqual(fan.interpolate(self.config['cpu_curve'],temperature,
                                                 self.config['curve_mode']),duty)
 
     def test_measured_airflow_points_are_reached_before_the_heat_guard(self):
-        for temperature, raw in ((65,19),(70,27),(75,36)):
+        for temperature, raw in ((70,19),(78,27),(80,36)):
             control, output = fan.AdaptiveCPU(temperature,0), fan.StagedFans()
             duty=1
             with patch.object(fan,'command'):
@@ -34,10 +34,10 @@ class CompilationTests(unittest.TestCase):
             self.assertLess(max(output.raw.values()),63)
 
     def test_cold_start_crosses_dead_zone_immediately_then_keeps_small_rpm_steps(self):
-        control,output=fan.AdaptiveCPU(65,0),fan.StagedFans()
+        control,output=fan.AdaptiveCPU(70,0),fan.StagedFans()
         with patch.object(fan,'command'):
             output.apply(self.config,1,0)
-            duty=control.update(self.config,65,1,1,0)
+            duty=control.update(self.config,70,1,1,0)
             self.assertEqual(duty,30)
             output.apply(self.config,duty,1)
             self.assertEqual(output.raw[3],19)
@@ -57,9 +57,9 @@ class CompilationTests(unittest.TestCase):
         self.assertLess(output.raw[1],output.raw[2])
 
     def test_step_down_and_fault_override_still_work(self):
-        control,output=fan.AdaptiveCPU(79,0),fan.StagedFans()
+        control,output=fan.AdaptiveCPU(85,0),fan.StagedFans()
         with patch.object(fan,'command'):
-            duty=control.update(self.config,79,1,1,100)
+            duty=control.update(self.config,85,1,1,100)
             output.apply(self.config,duty,1,emergency=True)
             for now in range(2,62):
                 duty=control.update(self.config,45,duty,now,0)

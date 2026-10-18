@@ -68,19 +68,25 @@ class AverageTemperatureTests(unittest.TestCase):
         self.assertEqual(s['target_percent'],1)
         self.assertEqual(set(s['fan_raw'].values()),{1})
 
-    def test_single_79c_core_still_forces_full_speed_in_staged_and_uniform_modes(self):
+    def test_single_85c_core_still_forces_full_speed_in_staged_and_uniform_modes(self):
         for staged in (True,False):
             fan.stop=False
-            s=self.run_cycle(79,staged=staged)
+            s=self.run_cycle(85,staged=staged)
             self.assertLess(s['cpu_average_c'],60)
             self.assertEqual(s['target_percent'],100)
             self.assertEqual(set(s['fan_duty_percent'].values()),{100})
 
     def test_raw_near_emergency_guard_still_responds_to_single_hot_core(self):
-        s=self.run_cycle(77)
+        s=self.run_cycle(83)
         self.assertLess(s['cpu_average_c'],60)
         self.assertGreaterEqual(s['target_percent'],100/3-.1)
         self.assertEqual(s['cpu_controller_state'],'high_temperature')
+
+    def test_old_79c_endpoint_no_longer_overrides_average_control(self):
+        s=self.run_cycle(79)
+        self.assertLess(s['cpu_average_c'],60)
+        self.assertEqual(s['target_percent'],1)
+        self.assertNotEqual(s['cpu_controller_state'],'high_temperature')
 
     def test_missing_bmc_sensor_still_forces_full_speed(self):
         s=self.run_cycle(40,broken=True)

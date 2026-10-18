@@ -70,7 +70,7 @@ duty must remain within **1–100%** and must not decrease, and each non-empty c
 must end at **100%**. `minimum_rpm` accepts **100–5000 RPM** and defaults to 100 in
 the base configuration. Existing installations keep their selected configuration.
 The CPU
-full-speed temperature must be at most **80°C**. The separate coretemp
+full-speed temperature must be at most **85°C**. The separate coretemp
 hardware-critical-minus-10°C override still applies. Empty curves inherit the first
 non-empty curve, in CPU/DIMM/PCH/ambient/backplane/inlet/exhaust order. Set
 `cpu_only` to `false` to include all curves in normal demand selection; the
@@ -92,13 +92,10 @@ On 18 October, manual supervised measurements on quanta1's CPU-facing fans
 | --- | --- | --- |
 | Below 50°C | 1% | 4,200 floor |
 | 60°C | 20% | near minimum |
-| 65°C | 30% | approximately 6,000 |
-| 70°C | 42% | approximately 9,000 |
-| 75°C | 57% | approximately 12,000 |
-| 76°C | 65% | increasing cooling |
-| 77°C | 75% | increasing cooling |
-| 78°C | 90% | increasing cooling |
-| 79°C | 100% | emergency |
+| 70°C | 30% | approximately 6,000 |
+| 78°C | 42% | approximately 9,000 |
+| 80°C | 57% | approximately 12,000 |
+| 85°C | 100% | emergency (explicitly selected above the normal curve) |
 
 Step mode holds 1% through 50–59°C until the first listed threshold at 60°C.
 These are the requested base curve points; the existing predictive/load/trim
@@ -111,8 +108,8 @@ The average drives normal curves, forecasts and temperature feedback. A brief
 Existing profiles without `cpu_temperature_mode` retain the historical `"max"`
 behavior; the setting also accepts `"average"`.
 
-Safety still uses the hottest raw CPU reading: the 76–79°C near-emergency guard,
-79°C full-speed endpoint, and hardware-critical-minus-10°C override cannot be
+Safety still uses the hottest raw CPU reading: the 82–85°C near-emergency guard,
+85°C full-speed endpoint, and hardware-critical-minus-10°C override cannot be
 hidden by averaging. Missing sensors and alarms still force protective behavior.
 Status/CLI expose `cpu_average_c` and `cpu_control_c` beside `cpu_max_c` and
 `cpu_core_max_c`, so both normal control and safety inputs remain visible.
@@ -137,8 +134,8 @@ Above that floor, upward steps are limited to three raw levels each second;
 normal demand rises at up to five percentage points per second. Downward
 limits remain two percentage points per second and three raw levels every
 two seconds. Existing profiles default to a 1% rise floor and retain their
-previous behavior. Sensor-fault, hardware-critical-margin and 79°C emergency
-protection remain active; the urgent guard now begins at 76°C.
+previous behavior. Sensor-fault, hardware-critical-margin and 85°C emergency
+protection remain active; the urgent guard begins at 82°C.
 
 ```bash
 bash scripts/install.sh --config config/quanta-fan-control.compilation.json
