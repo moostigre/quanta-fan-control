@@ -1,0 +1,150 @@
+{
+  "cpu_curve": [
+    [
+      0,
+      1
+    ],
+    [
+      45,
+      1
+    ],
+    [
+      50,
+      3
+    ],
+    [
+      55,
+      5
+    ],
+    [
+      60,
+      8
+    ],
+    [
+      65,
+      12
+    ],
+    [
+      68,
+      16
+    ],
+    [
+      70,
+      22
+    ],
+    [
+      72,
+      32
+    ],
+    [
+      74,
+      45
+    ],
+    [
+      76,
+      65
+    ],
+    [
+      78,
+      100
+    ]
+  ],
+  "dimm_curve": [],
+  "pch_curve": [],
+  "ambient_curve": [],
+  "backplane_curve": [],
+  "inlet_curve": [],
+  "exhaust_curve": [],
+  "required_fans": [
+    "SYS_FAN1-1",
+    "SYS_FAN1-2",
+    "SYS_FAN2-1",
+    "SYS_FAN2-2",
+    "SYS_FAN3-1",
+    "SYS_FAN3-2",
+    "SYS_FAN4-1",
+    "SYS_FAN4-2",
+    "SYS_FAN5-1",
+    "SYS_FAN5-2",
+    "SYS_FAN6-1",
+    "SYS_FAN6-2"
+  ],
+  "minimum_rpm": 100,
+  "interval_seconds": 1,
+  "fall_percent_per_cycle": 1,
+  "cpu_only": true,
+  "cpu_control_mode": "predictive",
+  "cpu_target_c": 67,
+  "curve_mode": "step",
+  "predictive": {
+    "load_curve": [
+      [
+        0,
+        1
+      ],
+      [
+        25,
+        4
+      ],
+      [
+        50,
+        7
+      ],
+      [
+        75,
+        10
+      ],
+      [
+        100,
+        14
+      ]
+    ],
+    "temperature_filter_seconds": 3,
+    "prediction_seconds": 5,
+    "prediction_max_c": 2,
+    "trim_interval_seconds": 20,
+    "cooldown_hold_seconds": 10,
+    "cooldown_interval_seconds": 10,
+    "rise_percent_per_second": 0.5,
+    "fall_percent_per_second": 2,
+    "load_release_seconds": 8,
+    "load_prediction_c": 1,
+    "deadband_c": 2,
+    "trim_step_percent": 1.5873015873015872
+  },
+  "fan_staging": {
+    "enabled": true,
+    "groups": [
+      [
+        3,
+        4
+      ],
+      [
+        2,
+        5
+      ],
+      [
+        1,
+        6
+      ]
+    ],
+    "activation_percent": [
+      0,
+      20,
+      32
+    ],
+    "idle_percent": 1,
+    "stage_hysteresis_percent": 2,
+    "stage_up_hold_seconds": 5,
+    "stage_down_hold_seconds": 15,
+    "output_hold_seconds": 5,
+    "output_step_raw": 1,
+    "output_hysteresis_raw": 0.25,
+    "refresh_seconds": 30,
+    "allocation_mode": "balanced",
+    "balance_floor_percent": 20,
+    "priority_bias_percent": 2,
+    "output_fall_hold_seconds": 2,
+    "output_fall_step_raw": 3
+  }
+}

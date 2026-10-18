@@ -43,6 +43,7 @@ CURVE_KEYS = ('cpu_curve', 'dimm_curve', 'pch_curve', 'ambient_curve',
 MINIMUM_DUTY_PERCENT = 1
 PREDICTIVE_DEFAULTS = {
     'load_curve': [[0, 1], [25, 8], [50, 15], [75, 22], [100, 28]],
+    'load_release_seconds': 45,
     'temperature_filter_seconds': 5,
     'prediction_seconds': 10,
     'prediction_max_c': 3,
@@ -69,12 +70,20 @@ STAGING_DEFAULTS = {
     'stage_down_hold_seconds': 30,
     'output_hold_seconds': 5,
     'output_step_raw': 2,
+    'output_fall_hold_seconds': 5,
+    'output_fall_step_raw': 2,
     'output_hysteresis_raw': .25,
     'refresh_seconds': 30,
 }
 
 def staging_options(config):
-    return dict(STAGING_DEFAULTS, **config.get('fan_staging', {}))
+    supplied = config.get('fan_staging', {})
+    options = dict(STAGING_DEFAULTS, **supplied)
+    # Existing profiles keep their symmetric slew unless explicitly tuned.
+    for suffix in ('hold_seconds', 'step_raw'):
+        if 'output_fall_' + suffix not in supplied:
+            options['output_fall_' + suffix] = options['output_' + suffix]
+    return options
 
 def validate_staging(config):
     supplied = config.get('fan_staging', {})
@@ -103,13 +112,14 @@ def validate_staging(config):
               'idle_percent': (1, 10), 'stage_hysteresis_percent': (1, 10),
               'stage_up_hold_seconds': (5, 60), 'stage_down_hold_seconds': (15, 120),
               'output_hold_seconds': (2, 15), 'output_step_raw': (1, 3),
+              'output_fall_hold_seconds': (1, 15), 'output_fall_step_raw': (1, 6),
               'output_hysteresis_raw': (.1, 1), 'refresh_seconds': (15, 60)}
     for key, (low, high) in bounds.items():
         v = options[key]
         if (not isinstance(v, (int, float)) or isinstance(v, bool)
                 or not math.isfinite(v) or not low <= v <= high):
             raise ValueError('fan_staging.' + key + ': expected %s-%s' % (low, high))
-    if not isinstance(options['output_step_raw'], int):
+    if any(not isinstance(options[k], int) for k in ('output_step_raw', 'output_fall_step_raw')):
         raise ValueError('fan_staging.output_step_raw must be an integer')
     if options['enabled'] and not config.get('cpu_only', False):
         raise ValueError('Staged CPU airflow requires cpu_only=true')
@@ -123,12 +133,13 @@ def validate_predictive(config):
         raise ValueError('predictive must be an object containing supported options')
     options = predictive_options(config)
     bounds = {
+        'load_release_seconds': (3, 60),
         'temperature_filter_seconds': (1, 15), 'prediction_seconds': (0, 20),
         'prediction_max_c': (0, 5), 'load_prediction_c': (0, 5),
         'deadband_c': (.5, 2), 'trim_step_percent': (.5, 5),
         'trim_interval_seconds': (5, 60), 'cooldown_hold_seconds': (10, 120),
         'cooldown_interval_seconds': (10, 120),
-        'rise_percent_per_second': (.1, 5), 'fall_percent_per_second': (.05, 1),
+        'rise_percent_per_second': (.1, 5), 'fall_percent_per_second': (.05, 5),
         'max_trim_percent': (5, 50),
     }
     for key, (low, high) in bounds.items():
@@ -181,8 +192,8 @@ def validate_config(c):
     for key in CURVE_KEYS:
         resolved[key] = [list(point) for point in (c[key] or first)]
     resolved['curve_sources'] = {key: key if c[key] else first_key for key in CURVE_KEYS}
-    if resolved['cpu_curve'][-1][0] > 68:
-        raise ValueError('CPU full-speed point must be <=68 C, including inherited curves')
+    if resolved['cpu_curve'][-1][0] > 80:
+        raise ValueError('CPU full-speed point must be <=80 C, including inherited curves')
     if not isinstance(resolved.get('cpu_only', False), bool):
         raise ValueError('cpu_only must be true or false')
     if resolved.get('curve_mode', 'linear') not in ('linear', 'step'):
@@ -196,9 +207,9 @@ def validate_config(c):
             raise ValueError('Predictive/adaptive CPU control requires cpu_only=true')
         target = resolved.get('cpu_target_c', 60)
         if (isinstance(target, bool) or not isinstance(target, (int, float))
-                or not math.isfinite(target) or not 40 <= target <= 60
+                or not math.isfinite(target) or not 40 <= target <= 70
                 or target > resolved['cpu_curve'][-1][0] - 3):
-            raise ValueError('cpu_target_c must be 40-60 C and at least 3 C below full speed')
+            raise ValueError('cpu_target_c must be 40-70 C and at least 3 C below full speed')
     if not resolved['required_fans']: raise ValueError('Required fans must be specified')
     if not 1 <= resolved['interval_seconds'] <= 5: raise ValueError('Interval must be 1–5 seconds')
     if not 1 <= resolved['fall_percent_per_cycle'] <= 5: raise ValueError('Fall limit must be 1–5%')
@@ -483,14 +494,15 @@ class StagedFans:
                 candidate = requested
             elif i in prime:
                 candidate = min(requested, floor_raw)
-            elif now - self.changed_at[i] < options['output_hold_seconds']:
+            elif now - self.changed_at[i] < (options['output_fall_hold_seconds']
+                    if requested < current else options['output_hold_seconds']):
                 candidate = current
             elif requested == 1 and current > 1:
-                candidate = max(1, current - options['output_step_raw'])
+                candidate = max(1, current - options['output_fall_step_raw'])
             elif desired > current + options['output_hysteresis_raw']:
                 candidate = min(requested, current + options['output_step_raw'])
             elif desired < current - 1 - options['output_hysteresis_raw']:
-                candidate = max(requested, current - options['output_step_raw'])
+                candidate = max(requested, current - options['output_fall_step_raw'])
             else:
                 candidate = current
             if prime and current is not None and candidate < current and i not in (overrides or {}):
@@ -585,10 +597,10 @@ class AdaptiveCPU:
         self.temperature, self.sample_time = temperature, now
         self.load_available = load is not None and math.isfinite(load) and 0 <= load <= 100
         if self.load_available:
-            # Feed-forward rises promptly and releases slowly after load ends.
+            # Load release is tunable independently of the rise filter.
             self.load_fast += -math.expm1(-elapsed / 3) * (load - self.load_fast)
             self.load_slow += -math.expm1(-elapsed / 30) * (load - self.load_slow)
-            load_tau = 3 if load > self.load else 45
+            load_tau = 3 if load > self.load else options['load_release_seconds']
             self.load += -math.expm1(-elapsed / load_tau) * (load - self.load)
             if self.trim < 0 and self.load > self.trim_load + 15:
                 self.trim = max(0, self.trim)  # do not reuse a low-load cooling correction
@@ -620,6 +632,10 @@ class AdaptiveCPU:
         # Anti-windup: once the JSON curve is the floor, extra negative
         # correction cannot affect output and must not accumulate invisibly.
         self.trim = max(minimum_trim, self.trim)
+        if temperature < target - 5 and self.filtered < target - 5 and self.trim > 0:
+            # A sustained cold CPU no longer needs a learned hot-load boost.
+            # Release at the normal output fall rate, even if load stays high.
+            self.trim = max(0, self.trim - options['fall_percent_per_second'] * slew_time)
         # One-degree BMC quantization must not restart the settling timers on
         # every alternating reading. A clear drop or sustained trend still
         # stops warming corrections promptly.

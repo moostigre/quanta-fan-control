@@ -70,11 +70,54 @@ duty must remain within **1–100%** and must not decrease, and each non-empty c
 must end at **100%**. `minimum_rpm` accepts **100–5000 RPM** and defaults to 100 in
 the base configuration. Existing installations keep their selected configuration.
 The CPU
-full-speed temperature must be at most **68°C**. Empty curves inherit the first
+full-speed temperature must be at most **80°C**. The separate coretemp
+hardware-critical-minus-10°C override still applies. Empty curves inherit the first
 non-empty curve, in CPU/DIMM/PCH/ambient/backplane/inlet/exhaust order. Set
 `cpu_only` to `false` to include all curves in normal demand selection; the
 highest demand wins. Temperature and fan health checks remain active in
 CPU-only mode.
+
+### Quieter compilation profile (65–70°C target)
+
+[`config/quanta-fan-control.quiet-load.json`](config/quanta-fan-control.quiet-load.json)
+targets **67°C with a ±2°C band**, using the hottest core/package or BMC CPU
+reading. `cpu_target_c` accepts 40–70°C and must remain at least 3°C below the
+configured full-speed point. This profile requests 8% at 60°C, 12% at 65°C,
+16% at 68°C, 22% at 70°C, and increasing cooling up to full speed at **78°C**.
+The three-degree urgent guard begins at 75°C. CPU hardware-critical margin,
+missing sensors, alarms, failed fans, watchdog and automatic-BMC fallback
+remain active. Existing profiles retain their full-speed endpoints.
+
+The BMC CPU readings can be hotter than the core graph: in the supplied
+compilation window, cores reached 64°C while BMC CPU temperature reached 68°C.
+The old 68°C endpoint triggered 100% duty and approximately 20,400 RPM. Replaying
+those recorded temperatures with this profile produced a 16% maximum request.
+Replay evaluates control decisions on recorded observations; it does not
+predict the temperature response to different airflow.
+
+The new profile reduces the provisional load estimate to 14% at full utilization,
+rises at 0.5 percentage points per second, and falls at 2 points per second.
+`predictive.load_release_seconds` is 8 seconds (45 by default for existing
+profiles). A learned positive hot-load correction releases at the output fall
+rate once both raw and filtered CPU temperatures are more than 5°C below target.
+Normal below-target learning also releases sooner in this profile.
+
+Fan staging keeps small upward steps (one raw level every five seconds), but
+allows downward steps of three raw levels every two seconds through
+`output_fall_step_raw` and `output_fall_hold_seconds`. Omitted falling options
+inherit the configured upward limits, preserving existing profiles. Helpers
+release after 15 seconds. A combined controller/PWM regression test verifies
+recovery from full speed to near-idle within one minute after a drop to 45°C.
+
+Install explicitly on each physical host, after checking live sensors:
+
+```bash
+bash scripts/install.sh --config config/quanta-fan-control.quiet-load.json
+```
+
+Use a real compilation and live temperature/RPM telemetry to validate the new
+thermal equilibrium. Fixed-observation replay and the qualitative thermal model
+are regression checks, not a calibrated model of either physical server.
 
 ### Load-aware predictive CPU control
 

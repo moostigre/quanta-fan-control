@@ -47,9 +47,9 @@ class ControllerTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'final point must be 100%'):
                     controller.validate_config(config)
 
-    def test_full_speed_cpu_threshold_cannot_exceed_68(self):
-        self.raw['cpu_curve'][-1][0] = 69
-        with self.assertRaisesRegex(ValueError, '<=68 C'):
+    def test_full_speed_cpu_threshold_cannot_exceed_80(self):
+        self.raw['cpu_curve'][-1][0] = 81
+        with self.assertRaisesRegex(ValueError, '<=80 C'):
             controller.validate_config(self.raw)
 
     def test_malformed_and_nonfinite_curves_are_rejected(self):
@@ -188,7 +188,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_adaptive_configuration_rejects_invalid_targets_and_multisensor_mode(self):
         self.raw['cpu_control_mode'] = 'adaptive'
-        for value in [False, 39, 61, float('nan')]:
+        for value in [False, 39, 71, float('nan')]:
             self.raw['cpu_target_c'] = value
             with self.assertRaises(ValueError):
                 controller.validate_config(self.raw)
