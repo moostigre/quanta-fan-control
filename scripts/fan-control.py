@@ -85,6 +85,7 @@ def main():
                 ('control_mode', 'fan_control_mode', 'cpu_max_c', 'cpu_average_c', 'cpu_control_c',
                  'cpu_temperature_mode', 'cpu_target_c',
                  'cpu_load_percent', 'fan_stages_active', 'manual_overrides', 'fan_duty_percent', 'rpm',
+                 'cpu_sockets', 'fan_target_rpm', 'fan_rpm_sensor',
                  'manual_safety_override', 'faults')}, indent=2))
             return 0
         request = parse_command(args)

@@ -1,0 +1,80 @@
+{
+  "cpu_curve": [
+    [
+      0,
+      1
+    ],
+    [
+      65,
+      30
+    ],
+    [
+      85,
+      100
+    ]
+  ],
+  "dimm_curve": [],
+  "pch_curve": [],
+  "ambient_curve": [],
+  "backplane_curve": [],
+  "inlet_curve": [],
+  "exhaust_curve": [],
+  "required_fans": [
+    "SYS_FAN1-1",
+    "SYS_FAN1-2",
+    "SYS_FAN2-1",
+    "SYS_FAN2-2",
+    "SYS_FAN3-1",
+    "SYS_FAN3-2",
+    "SYS_FAN4-1",
+    "SYS_FAN4-2",
+    "SYS_FAN5-1",
+    "SYS_FAN5-2",
+    "SYS_FAN6-1",
+    "SYS_FAN6-2"
+  ],
+  "minimum_rpm": 100,
+  "interval_seconds": 1,
+  "fall_percent_per_cycle": 1,
+  "cpu_only": true,
+  "cpu_control_mode": "curve",
+  "cpu_target_c": 65,
+  "curve_mode": "step",
+  "fan_staging": {
+    "enabled": false,
+    "idle_percent": 1,
+    "output_hold_seconds": 2,
+    "output_step_raw": 1,
+    "output_fall_hold_seconds": 2,
+    "output_fall_step_raw": 2,
+    "rise_floor_percent": 30,
+    "refresh_seconds": 30
+  },
+  "cpu_temperature_mode": "max",
+  "per_cpu_fans": {
+    "enabled": true,
+    "fan_order": [
+      [
+        2,
+        3,
+        1
+      ],
+      [
+        5,
+        4,
+        6
+      ]
+    ],
+    "rpm_sensor": 1,
+    "lead_rpm": 6000,
+    "max_rpm": 16000,
+    "rpm_step": 1000,
+    "rpm_tolerance": 200,
+    "rpm_start_percent": 30,
+    "rpm_control_interval_seconds": 5,
+    "stage_up_hold_seconds": 10,
+    "stage_down_hold_seconds": 30,
+    "stage_stall_seconds": 30,
+    "temperature_hysteresis_c": 1
+  }
+}

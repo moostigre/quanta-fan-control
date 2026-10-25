@@ -77,6 +77,79 @@ non-empty curve, in CPU/DIMM/PCH/ambient/backplane/inlet/exhaust order. Set
 highest demand wins. Temperature and fan health checks remain active in
 CPU-only mode.
 
+### Independent CPU banks with RPM feedback
+
+[`config/quanta-fan-control.per-cpu.json`](config/quanta-fan-control.per-cpu.json)
+selects two independent CPU cooling controllers:
+
+| Physical CPU package | Fan bank | Lead fan | First helper | Last helper |
+| --- | --- | --- | --- | --- |
+| CPU 0 | 1, 2, 3 | **2** | **3** | **1** |
+| CPU 1 | 4, 5, 6 | **5** | **4** | **6** |
+
+Each bank follows its own CPU temperature. The supplied profile uses the hottest
+core/package/BMC CPU reading on that socket; a cool CPU cannot dilute the other
+CPU's feedback. Setting `cpu_temperature_mode: "average"` averages readings
+**within each socket**, never across sockets. Package identity comes from the
+kernel's `Package id 0/1` labels, not the order of the hwmon directories.
+The fan order follows the requested physical layout. If the chassis CPU labels
+are reversed, swap the two lists in `per_cpu_fans.fan_order`.
+
+At the profile's `cpu_target_c` of **65°C**, the lead module starts toward
+**6,000 RPM**. Its PWM is adjusted using measured `SYS_FAN2-1` or `SYS_FAN5-1`
+RPM. Each module has two counter-rotating rotors but one PWM command. The `-1`
+rotor is the reference, matching the existing front-rotor calibration; the `-2`
+rotor will normally have a different RPM and remains monitored for health.
+`per_cpu_fans.rpm_sensor` can select either rotor (1 or 2).
+
+If that CPU stays above **66°C** after the active fans reach their RPM targets
+for ten seconds, its next helper joins at 6,000 RPM. Only after the first helper
+also reaches speed does the last helper join. If all three are at speed and more
+cooling is still needed, their targets increase together in 1,000 RPM steps,
+up to 16,000 RPM. A hot socket therefore uses its own helpers before requesting
+higher RPM from the whole bank. The other socket follows its own sequence.
+An unreachable RPM target cannot hold up assistance indefinitely: after 30
+continuous hot seconds without readiness, the next helper is recruited and
+`assisted_after_timeout` is reported. Below **64°C** for 30 seconds, higher RPM
+targets decrease first, then helpers withdraw in reverse order, then the lead
+returns to minimum rotation. These holds reset when their conditions cease.
+
+RPM feedback makes one BMC-level correction at most every five seconds, with a
+±200 RPM deadband. It waits for held PWM outputs to catch up before adjusting
+again. The initial 30% PWM is a starting estimate; measured RPM closes the loop.
+An exact 6,000 RPM value is not guaranteed by the BMC's quantized PWM or by every
+module's response. Inactive modules keep rotating at the existing minimum.
+
+Near the raw full-speed endpoint, the affected bank bypasses staging holds and
+accelerates. **Either CPU reaching the configured emergency endpoint, a hardware
+critical margin, or any monitored sensor/fan fault still requests all six modules
+at full speed.** Exit/watchdog recovery to BMC automatic control is retained.
+Manual per-fan commands continue to work; an overridden lead does not block
+automatic assistance, and its RPM feedback does not accumulate corrections.
+
+To select this profile explicitly:
+
+```bash
+bash scripts/install.sh --config config/quanta-fan-control.per-cpu.json
+```
+
+`per_cpu_fans.enabled` is opt-in; legacy profiles retain their existing behavior.
+Keep `fan_staging.enabled` false for this mode. Its output hold, slew, idle,
+dead-zone floor and refresh options still govern the shared PWM writer, but its
+old paired allocation is replaced. Normal per-CPU control uses the temperature
+target, stage holds and RPM feedback; the legacy aggregate load predictor is
+not used to drive either bank. The final `cpu_curve` endpoint still supplies
+the raw-temperature safety boundary.
+
+All RPM/stage defaults are listed in `PER_CPU_DEFAULTS` and in the supplied
+profile. `fan-control status` adds `cpu_sockets`, `fan_target_rpm`, and
+`fan_rpm_sensor`, alongside actual per-rotor RPM and per-module PWM. Per-socket
+status includes its temperature, active fan order, RPM target, urgency and any
+timeout assistance. Tests exercise asymmetric CPU temperatures, measured-RPM
+stage gating, slow/unreachable fan response, cooldown, overrides, missing package
+sensors and emergency broadcast. Physical thermal behavior still requires
+validation on the selected host; this branch does not activate itself.
+
 ### Current compilation profile: 65°C with useful intermediate airflow
 
 Use [`config/quanta-fan-control.compilation.json`](config/quanta-fan-control.compilation.json).
