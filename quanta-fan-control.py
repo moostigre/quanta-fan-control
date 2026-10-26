@@ -199,6 +199,8 @@ def validate_config(c):
         raise ValueError('CPU full-speed point must be <=85 C, including inherited curves')
     if not isinstance(resolved.get('cpu_only', False), bool):
         raise ValueError('cpu_only must be true or false')
+    if not isinstance(resolved.get('cpu_package_control', True), bool):
+        raise ValueError('cpu_package_control must be true or false')
     if resolved.get('curve_mode', 'linear') not in ('linear', 'step'):
         raise ValueError('curve_mode must be linear or step')
     if resolved.get('cpu_control_mode', 'curve') not in ('curve', 'adaptive', 'predictive'):
@@ -252,27 +254,52 @@ def read_sensors():
     if pathlib.Path(SDR_CACHE).is_file(): args.extend(['-S', SDR_CACHE])
     return parse_sensors(command(*args, 'sdr', 'list', 'full'))
 
-def core_temperatures():
-    values, critical, devices = [], [], 0
+def package_control(config):
+    return config.get('cpu_only', False) and config.get('cpu_package_control', True)
+
+
+def core_temperatures(by_package=False):
+    values, critical, devices, packages = [], [], 0, {}
     for name in glob.glob('/sys/class/hwmon/hwmon*/name'):
         if pathlib.Path(name).read_text().strip() != 'coretemp': continue
         devices += 1
         inputs = list(pathlib.Path(name).parent.glob('temp*_input'))
         if not inputs:
             raise RuntimeError('Both CPUs require temperature readings')
+        package_values, package_critical = [], []
         for p in inputs:
             value = float(p.read_text()) / 1000
             if not math.isfinite(value) or not 0 <= value <= 120:
                 raise RuntimeError('Invalid CPU temperature: ' + str(p))
             values.append(value)
+            package_values.append(value)
         for p in pathlib.Path(name).parent.glob('temp*_crit'):
             limit = float(p.read_text()) / 1000
             if not math.isfinite(limit) or not 0 < limit <= 120:
                 raise RuntimeError('Invalid CPU critical temperature: ' + str(p))
             critical.append(limit)
+            package_critical.append(limit)
+        if by_package:
+            device = pathlib.Path(name).parent
+            labels = {p: p.read_text().strip() for p in device.glob('temp*_label')}
+            ids = [s.removeprefix('Package id ') for s in labels.values() if s.startswith('Package id ')]
+            if (len(ids) != 1 or ids[0] not in ('0', '1') or ids[0] in packages
+                    or not package_critical or len(package_values) < 2
+                    or any(not p.with_name(p.name.replace('_label', '_input')).is_file() for p in labels)):
+                raise RuntimeError('Both CPUs require unique package labels and complete temperature readings')
+            packages[ids[0]] = package_values
     if devices != 2 or not values or not critical:
         raise RuntimeError('Both CPU coretemp devices are required')
+    if by_package:
+        if set(packages) != {'0', '1'}:
+            raise RuntimeError('Temperature readings for both CPU packages are required')
+        return max(values), min(critical), values, packages
     return max(values), min(critical), values
+
+
+def temperature_sample(config):
+    if package_control(config): return core_temperatures(by_package=True)
+    return (*core_temperatures(), None)
 
 def cpu_temperature_summary(config, core_values, temperatures):
     # Equal weight for every core/package input and each BMC CPU reading.
@@ -471,8 +498,11 @@ class StagedFans:
                     result[selector] = min(100, baseline + extra[i])
         return result
 
-    def apply(self, config, demand, now, emergency=False, urgent=False, overrides=None, force=()):
+    def apply(self, config, demand, now, emergency=False, urgent=False, overrides=None, force=(),
+              targets=None, urgent_fans=(), banks=()):
         options = staging_options(config)
+        external_targets = targets is not None
+        urgent_fans = set(urgent_fans)
         signature = json.dumps(options, sort_keys=True)
         if signature != self.signature:
             # Reset allocation timers, retaining the known physical outputs so
@@ -490,14 +520,16 @@ class StagedFans:
             self.active = [True] * 3
             self.allocated = {i: 100 for i in self.raw}
             return {str(i): 100.0 for i in self.raw}
-        if options['enabled']:
+        if external_targets:
+            targets = dict(targets)
+        elif options['enabled']:
             targets = self.targets(options, demand, now, urgent)
         else:
             targets = {i: demand for i in range(1, 7)}
             self.active = [True] * 3
         self.allocated = dict(targets)
         for i, percent in (overrides or {}).items():
-            targets[i] = max(targets[i], percent) if urgent else percent
+            targets[i] = max(targets[i], percent) if urgent or i in urgent_fans else percent
         refresh = self.refreshed_at is None or now - self.refreshed_at >= options['refresh_seconds']
         # Bringing helpers through a long PWM dead zone must not withdraw
         # primary cooling first. Prime only automatic helpers to that floor;
@@ -505,7 +537,8 @@ class StagedFans:
         prime = {}
         if options['enabled'] and options['allocation_mode'] == 'balanced' and not urgent:
             floor_raw = math.ceil(options['balance_floor_percent'] * 63 / 100)
-            for group in options['groups'][1:]:
+            helpers = [bank[1:] for bank in banks] if external_targets else options['groups'][1:]
+            for group in helpers:
                 for i in group:
                     if (i not in (overrides or {}) and i in self.raw
                             and self.raw[i] < floor_raw
@@ -525,7 +558,7 @@ class StagedFans:
             desired = max(1, min(63, targets[i] * 63 / 100))
             requested = math.ceil(desired)
             current = self.raw.get(i)
-            if current is None or urgent or i in force:
+            if current is None or urgent or i in urgent_fans or i in force:
                 candidate = requested
             elif i in prime:
                 candidate = min(requested, prime[i])
@@ -540,7 +573,8 @@ class StagedFans:
                 candidate = max(requested, current - options['output_fall_step_raw'])
             else:
                 candidate = current
-            if prime and current is not None and candidate < current and i not in (overrides or {}):
+            hold_cooling = not external_targets or any(i in bank and set(bank) & set(prime) for bank in banks)
+            if prime and hold_cooling and current is not None and candidate < current and i not in (overrides or {}):
                 candidate = current
             if candidate != current or i in force: changes[i] = candidate
         if refresh:
@@ -561,17 +595,99 @@ class StagedFans:
                 'fan_stages_active': list(self.active)}
 
 
+class PackageFans:
+    """Master's temperature controller/allocator, independently for each CPU."""
+    BANKS = ((2, 3), (5, 4))
+
+    def __init__(self):
+        self.controls, self.previous, self.allocators = {}, {}, {}
+        self.packages, self.urgent_fans = {}, set()
+        self.signature = None
+        self.emergency = False
+
+    def targets(self, config, packages, temperatures, now, loads=None, overrides=None, emergency=False):
+        local = dict(config, cpu_temperature_mode='average')
+        options = staging_options(config)
+        signature = json.dumps([local['cpu_curve'], local.get('curve_mode'),
+            local.get('cpu_control_mode'), local.get('cpu_target_c'), predictive_options(local), options], sort_keys=True)
+        if signature != self.signature:
+            self.__init__()
+            self.signature = signature
+        self.emergency = emergency
+        targets = {1: options['idle_percent'], 6: options['idle_percent']}
+        self.packages, self.urgent_fans = {}, set()
+        for socket_id, fans in enumerate(self.BANKS):
+            key = str(socket_id)
+            peak, average, _ = cpu_temperature_summary(local, packages[key],
+                {'CPU%d Temp' % socket_id: temperatures['CPU%d Temp' % socket_id]})
+            control = self.controls.setdefault(key, AdaptiveCPU(average, now))
+            previous = self.previous.get(key, interpolate(local['cpu_curve'], average, local.get('curve_mode', 'linear')))
+            load = (loads or {}).get(key)
+            if local.get('cpu_control_mode', 'curve') in ('adaptive', 'predictive'):
+                demand = control.update(local, average, previous, now, load,
+                    learn=not emergency and not (set(fans) | {1 if socket_id == 0 else 6}) & set(overrides or {}))
+            else:
+                demand = cooldown(interpolate(local['cpu_curve'], average,
+                    local.get('curve_mode', 'linear')), previous, local['fall_percent_per_cycle'])
+                control.state, control.desired = 'curve', demand
+            urgent = peak >= local['cpu_curve'][-1][0] - 3
+            if urgent:
+                guard = 100 * (peak - local['cpu_curve'][-1][0] + 3) / 3
+                demand = max(demand, guard)
+                control.desired = max(control.desired, guard)
+                control.state = 'high_temperature'
+                self.urgent_fans.update(fans)
+            if emergency:
+                demand = 100
+                control.state, control.desired = 'emergency', 100
+            self.previous[key] = demand
+            allocator = self.allocators.setdefault(key, StagedFans())
+            if options['enabled']:
+                # Reuse the existing two normal stages and all their tuning.
+                # Outer modules are absent, so no ordinary demand can enlist them.
+                bank_options = dict(options, groups=[[fans[0]], [fans[1]]],
+                                    activation_percent=options['activation_percent'][:2])
+                targets.update(allocator.targets(bank_options, demand, now, urgent or emergency))
+            else:
+                targets.update({i: demand for i in fans})
+            self.packages[key] = {'average_c': round(average, 2), 'peak_c': peak,
+                'normal_fans': list(fans), 'emergency_fan': 1 if socket_id == 0 else 6,
+                'target_percent': round(demand, 2), 'load_percent': load,
+                'fan_stages_active': list(allocator.active[:2]), **control.status()}
+        if emergency: targets = {i: 100 for i in range(1, 7)}
+        return targets
+
+    def status(self):
+        result = {'cpu_packages': self.packages}
+        if self.packages:
+            result['fan_stages_active'] = [True, any(p['fan_stages_active'][1]
+                for p in self.packages.values()), self.emergency]
+        return result
+
+
 class CPULoad:
     """Host CPU busy time, including guests once; exclude idle, iowait and steal."""
-    def __init__(self, path='/proc/stat'):
+    def __init__(self, path='/proc/stat', package=None, topology='/sys/devices/system/cpu'):
         self.path, self.previous, self.available = path, None, False
+        self.package, self.topology = package, pathlib.Path(topology)
 
     def sample(self):
         try:
             lines = pathlib.Path(self.path).read_text().splitlines()
-            fields = next(line.split()[1:] for line in lines if line.startswith('cpu '))
-            values = tuple(int(v) for v in fields[:8])
-            count = sum(line.split()[0][3:].isdigit() for line in lines if line.startswith('cpu'))
+            if self.package is None:
+                fields = next(line.split()[1:] for line in lines if line.startswith('cpu '))
+                values = tuple(int(v) for v in fields[:8])
+                count = sum(line.split()[0][3:].isdigit() for line in lines if line.startswith('cpu'))
+            else:
+                counters = []
+                for line in lines:
+                    fields = line.split()
+                    if not fields or not fields[0].startswith('cpu') or not fields[0][3:].isdigit(): continue
+                    socket_id = (self.topology / fields[0] / 'topology/physical_package_id').read_text().strip()
+                    if socket_id == str(self.package): counters.append(tuple(int(v) for v in fields[1:9]))
+                if not counters or any(len(c) != 8 for c in counters): raise ValueError('Invalid package counters')
+                values = tuple(sum(c[i] for c in counters) for i in range(8))
+                count = len(counters)
             if len(values) != 8 or any(v < 0 for v in values) or not count:
                 raise ValueError('Invalid /proc/stat CPU counters')
         except (OSError, ValueError, StopIteration):
@@ -743,11 +859,16 @@ def main():
     sensors = read_sensors()
     tracked_fans = set(config['required_fans']) | {n for n,s in sensors.items() if s['unit']=='RPM' and n.startswith('SYS_FAN') and (s['value'] or 0)>0}
     tracked_temps = {'CPU0 Temp','CPU1 Temp','PCH Temp','Ambient_Temp','BP_Temp','Inlet_Temp','Exhaust_Temp'} | {n for n,s in sensors.items() if n.startswith('Temp_DIMM_') and s['value'] is not None}
-    core_max, core_critical, core_values = core_temperatures()
+    core_max, core_critical, core_values, packages = temperature_sample(config)
     target, reasons, temperatures = demand(config,sensors,core_max,core_critical,tracked_fans,tracked_temps, core_values)
     cpu_max, cpu_average, cpu_control = cpu_temperature_summary(config, core_values, temperatures)
+    package_fans = PackageFans()
     if args.check:
-        print(json.dumps({'target_percent':round(target,1),'faults':reasons,'core_max_c':core_max,'cpu_average_c':round(cpu_average, 2),'cpu_control_c':round(cpu_control, 2),'cpu_temperature_mode':config.get('cpu_temperature_mode', 'max'),'temperatures_c':temperatures,'monitored_fans':sorted(tracked_fans),'curve_sources':config['curve_sources'],'cpu_only':config.get('cpu_only', False),'curve_mode':config.get('curve_mode','linear')},indent=2)); return
+        if packages is not None and not reasons:
+            target = max(package_fans.targets(config, packages, temperatures, time.monotonic(),
+                emergency=cpu_max >= config['cpu_curve'][-1][0]).values())
+            cpu_control = max(p['average_c'] for p in package_fans.packages.values())
+        print(json.dumps({'target_percent':round(target,1),'faults':reasons,'core_max_c':core_max,'cpu_average_c':round(cpu_average, 2),'cpu_control_c':round(cpu_control, 2),'cpu_temperature_mode':config.get('cpu_temperature_mode', 'max'),'temperatures_c':temperatures,'monitored_fans':sorted(tracked_fans),'curve_sources':config['curve_sources'],'cpu_only':config.get('cpu_only', False),'curve_mode':config.get('curve_mode','linear'),**package_fans.status()},indent=2)); return
     if reasons: raise RuntimeError('Initial health check failed: ' + '; '.join(reasons))
     signal.signal(signal.SIGTERM,on_signal); signal.signal(signal.SIGINT,on_signal)
     pathlib.Path(STATE).parent.mkdir(parents=True,exist_ok=True)
@@ -755,6 +876,8 @@ def main():
     adaptive = AdaptiveCPU(cpu_control, time.monotonic())
     cpu_load = CPULoad()
     cpu_load.sample()  # establish counters without waiting or making BMC reads
+    package_loads = {str(i): CPULoad(package=i) for i in (0, 1)}
+    for sampler in package_loads.values(): sampler.sample()
     staged_fans = StagedFans()
     control = None
     try:
@@ -779,13 +902,19 @@ def main():
             # Remember any additional fans/DIMMs reconnected during this run.
             tracked_fans.update(n for n,s in sensors.items() if n.startswith('SYS_FAN') and (s['value'] or 0)>0)
             tracked_temps.update(n for n,s in sensors.items() if n.startswith('Temp_DIMM_') and s['value'] is not None)
-            core_max, core_critical, core_values = core_temperatures()
+            per_package = package_control(config)
+            try:
+                core_max, core_critical, core_values, packages = temperature_sample(config)
+            except (OSError, ValueError, RuntimeError) as error:
+                if not per_package: raise
+                packages = None
+                read_error = (read_error + '; ' if read_error else '') + 'CPU package read failed: ' + str(error)
             target,reasons,temperatures = demand(config,sensors,core_max,core_critical,tracked_fans,tracked_temps, core_values)
             if read_error:
                 reasons.append('sensor read failed: ' + read_error)
             cpu_max, cpu_average, cpu_control = cpu_temperature_summary(config, core_values, temperatures)
             load = cpu_load.sample()
-            predictive = config.get('cpu_control_mode', 'curve') in ('adaptive', 'predictive')
+            predictive = not per_package and config.get('cpu_control_mode', 'curve') in ('adaptive', 'predictive')
             if predictive and not reasons:
                 target = adaptive.update(config, cpu_control, previous, time.monotonic(), load,
                                          learn=not control.overrides)
@@ -808,15 +937,40 @@ def main():
                 adaptive.state = 'high_temperature'
             demand_percent = adaptive.desired if predictive and not reasons else target
             # Never delay rising speed; let falling speed settle gradually.
-            if not predictive and not emergency:
+            if not predictive and not emergency and not per_package:
                 target = cooldown(target, previous, config['fall_percent_per_cycle'])
-            if staging_options(config)['enabled'] or control.overrides or force:
+            urgent_selectors = set(range(1, 7)) if urgent else set()
+            if per_package:
+                if reasons:
+                    package_fans = PackageFans()
+                    targets = {i: 100 for i in range(1, 7)}
+                    urgent_selectors = set(range(1, 7))
+                else:
+                    targets = package_fans.targets(config, packages, temperatures, time.monotonic(),
+                        {k: s.sample() for k, s in package_loads.items()}, control.overrides, emergency)
+                    urgent_selectors = package_fans.urgent_fans
+                # Auxiliary fans return to minimum as soon as the emergency ends.
+                outer_force = {i for i in (1, 6) if i not in control.overrides
+                    and staged_fans.raw.get(i) != math.ceil(targets[i] * 63 / 100)}
+                target = demand_percent = max(targets.values())
+                fan_duties = staged_fans.apply(config, target, time.monotonic(), emergency=emergency,
+                    targets=targets, urgent_fans=urgent_selectors, overrides=control.overrides,
+                    force=force | outer_force, banks=PackageFans.BANKS)
+                effective = max(fan_duties.values())
+                fan_status = staged_fans.status()
+                fan_status.update(package_fans.status())
+                if package_fans.packages:
+                    cpu_control = max(p['average_c'] for p in package_fans.packages.values())
+                adaptive.state, adaptive.desired = ('emergency' if emergency else 'per_package'), target
+            elif staging_options(config)['enabled'] or control.overrides or force:
+                package_fans = PackageFans()
                 fan_duties = staged_fans.apply(config, target, time.monotonic(),
                     emergency=emergency, urgent=urgent,
                     overrides=control.overrides, force=force)
                 effective = max(fan_duties.values())
                 fan_status = staged_fans.status()
             else:
+                package_fans = PackageFans()
                 effective = manual(target)
                 fan_duties = {str(i): effective for i in range(1, 7)}
                 fan_status = {'fan_stages_active': [True] * 3}
@@ -827,11 +981,13 @@ def main():
                       'duty_percent':effective,'target_percent':round(target,1),
                       'demand_percent':round(demand_percent,1),
                       'fan_duty_percent':fan_duties,
-                      'fan_control_mode':'staged' if staging_options(config)['enabled'] else 'uniform',
+                      'fan_control_mode':('per_package' if per_package else
+                                          'staged' if staging_options(config)['enabled'] else 'uniform'),
                       'manual_overrides':{str(i):v for i,v in control.overrides.items()},
                       'control_mode':('manual' if len(control.overrides) == 6 else
                                       'mixed' if control.overrides else 'auto'),
-                      'manual_safety_override':bool(control.overrides) and (emergency or urgent),
+                      'manual_safety_override':bool(control.overrides) and
+                          (emergency or bool(set(control.overrides) & urgent_selectors)),
                       'cycle_work_seconds':round(time.monotonic()-cycle_started,3),
                       'cpu_control_mode':config.get('cpu_control_mode', 'curve'),
                       'cpu_target_c':config.get('cpu_target_c', 60),
@@ -839,7 +995,7 @@ def main():
                       'cpu_max_c':cpu_max,
                       'cpu_average_c':round(cpu_average, 2),
                       'cpu_control_c':round(cpu_control, 2),
-                      'cpu_temperature_mode':config.get('cpu_temperature_mode', 'max'),
+                      'cpu_temperature_mode':'average' if per_package else config.get('cpu_temperature_mode', 'max'),
                       'cpu_core_max_c':core_max,'temperatures_c':temperatures,'faults':reasons,
                       'rpm':{n:sensors.get(n,{}).get('value') for n in sorted(tracked_fans)},
                       'curve_sources':config['curve_sources'],

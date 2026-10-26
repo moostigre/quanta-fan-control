@@ -16,6 +16,7 @@ class AverageTemperatureTests(unittest.TestCase):
         fan.stop = False
         self.config = fan.validate_config(json.loads(
             (ROOT/'config/quanta-fan-control.compilation.json').read_text()))
+        self.config['cpu_package_control'] = False  # legacy global-average compatibility
         self.temperatures = {'CPU0 Temp':40,'CPU1 Temp':40,'PCH Temp':50,
                              'Ambient_Temp':20,'BP_Temp':25,'Inlet_Temp':30,'Exhaust_Temp':35}
         self.sensors = {name:dict(value=value,unit='degrees C',status='ok')

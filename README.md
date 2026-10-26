@@ -77,13 +77,50 @@ non-empty curve, in CPU/DIMM/PCH/ambient/backplane/inlet/exhaust order. Set
 highest demand wins. Temperature and fan health checks remain active in
 CPU-only mode.
 
+### Per-CPU package averages and fan banks
+
+On this branch CPU-only control uses a separate average for each physical CPU
+by default. The existing curves, predictive feedback, target temperatures and
+PWM hold/slew settings are retained. Each average contains that package's Linux
+core/package readings and its own BMC CPU reading, with the same equal weighting
+as the master version. Package identity uses `Package id 0/1`, not hwmon order.
+
+| CPU bank | Primary fan | Helper fan | Emergency-only fan |
+| --- | --- | --- | --- |
+| CPU 0: fans 1, 2, 3 | 2 | 3 | 1 |
+| CPU 1: fans 4, 5, 6 | 5 | 4 | 6 |
+
+Each CPU's temperature determines its own normal fan speeds. When staging is
+enabled, its helper uses the existing second-stage threshold, hysteresis and
+timers. Balanced/priority allocation still applies, but only across that CPU's
+two normal fans. The third ordinary stage is removed: fans **1 and 6 remain at
+minimum rotation during normal automatic operation**, regardless of CPU demand.
+They run at full speed in emergencies and return to minimum when the emergency
+ends. Existing explicit manual commands remain available.
+
+There is **no RPM target or RPM feedback loop**. The RPM values in the calibration
+table below describe measurements only. Each predictive controller also uses
+CPU utilization from its own physical package; prediction, correction and
+cooldown state are independent. A near-emergency raw temperature accelerates
+that CPU's normal fans. Either CPU reaching the raw full-speed endpoint, a
+hardware critical margin, or a monitored sensor/fan fault still commands all
+six modules to full speed. Missing package identification fails the read-only
+preflight; a runtime package-read failure requests full speed.
+
+`fan-control status` adds `cpu_packages`, including each average, peak,
+normal/emergency fan mapping, CPU load and controller state. `cpu_control_c`
+summarizes the higher package average; `cpu_average_c` remains a whole-host
+overview. No temperature curve or packaged profile needs replacing to use this
+branch. Set `cpu_package_control: false` explicitly for the legacy whole-host
+controller; the legacy global `cpu_temperature_mode` applies in that mode.
+
 ### Current compilation profile: 65°C with useful intermediate airflow
 
 Use [`config/quanta-fan-control.compilation.json`](config/quanta-fan-control.compilation.json).
 It replaces the quiet-load profile after a real 44-thread compilation showed
 that 8–16% PWM remained near idle RPM and delayed effective cooling until the
-75°C guard. Its target is **65°C ±1°C**, measured from the arithmetic mean of all
-core/package readings and the two BMC CPU sensors (`cpu_temperature_mode: "average"`).
+75°C guard. Its target is **65°C ±1°C**, measured independently from each
+CPU package's average in the default per-package mode.
 
 On 18 October, manual supervised measurements on quanta1's CPU-facing fans
 3 and 4 gave these approximate **front-rotor** speeds:
@@ -101,12 +138,12 @@ Step mode holds 1% through 50–59°C until the first listed threshold at 60°C.
 These are the requested base curve points; the existing predictive/load/trim
 adjustments and fan allocation still apply. The 65°C feedback target is retained.
 
-Every core/package `coretemp` input and each BMC CPU reading has equal weight.
+Every core/package `coretemp` input and its package's BMC CPU reading has equal weight.
 RAM/DIMM, inlet, exhaust and other non-CPU sensors are excluded from this mean.
 The average drives normal curves, forecasts and temperature feedback. A brief
 70°C spike on one otherwise cool core therefore does not select the 70°C step.
-Existing profiles without `cpu_temperature_mode` retain the historical `"max"`
-behavior; the setting also accepts `"average"`.
+With `cpu_package_control: false`, profiles without `cpu_temperature_mode` retain
+the historical global `"max"` behavior; the setting also accepts `"average"`.
 
 Safety still uses the hottest raw CPU reading: the 82–85°C near-emergency guard,
 85°C full-speed endpoint, and hardware-critical-minus-10°C override cannot be
@@ -122,10 +159,10 @@ not closed-loop RPM guarantees, and other fan modules/hosts can differ.
 
 The profile filters temperature over one second and predicts three seconds
 of warming, capped at +2°C. The load estimate spans 1–42% PWM and correction
-is bounded to ±10 percentage points. Priority allocation keeps the primary
-pair's requested speed when neighbours join (thresholds 30% and 50%); it does
-not split a demand of 57% into several low-PWM requests. Neighbours still
-join after five seconds of sustained demand.
+is bounded to ±10 percentage points. Priority allocation keeps each CPU's lead
+fan at its requested speed when its helper joins (threshold 30%). Helpers still
+join after five seconds of sustained demand. The former 50% third stage is used
+only in legacy global mode; the outer fans are emergency-only in package mode.
 
 `fan_staging.rise_floor_percent: 30` bypasses ineffective PWM values when
 rising demand reaches that floor, both in scalar demand and physical outputs.
@@ -210,7 +247,8 @@ Install it explicitly only when replacing configuration is intended:
 bash scripts/install.sh --config config/quanta-fan-control.predictive.json
 ```
 
-The controller samples host CPU utilization from `/proc/stat` each cycle,
+The controller samples CPU utilization from `/proc/stat` each cycle, per physical
+package in package mode and for the whole host in legacy global mode,
 including virtual-machine CPU work. It excludes idle, iowait and steal, and
 avoids counting guest time twice. CPU utilization is an early heat hint,
 **not a measurement of power**: instruction mix, frequency and package load
@@ -301,7 +339,11 @@ replay cannot prove the thermal response of the new commands. Regression tests
 also exercise a qualitative delayed thermal model, not a calibrated host model.
 Linux documents the CPU counters in [proc_stat(5)](https://man7.org/linux/man-pages/man5/proc_stat.5.html).
 
-### Balanced CPU fan pairs
+### Legacy balanced CPU fan pairs
+
+This whole-host pairing applies with `cpu_package_control: false`. Default
+package mode instead allocates the first two stages separately to 2/3 and 5/4,
+with 1/6 reserved for emergencies as described above.
 
 [`config/quanta-fan-control.staged.json`](config/quanta-fan-control.staged.json)
 uses early assistance and balances cooling across neighbouring modules. The

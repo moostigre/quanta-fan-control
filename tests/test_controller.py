@@ -22,6 +22,7 @@ class ControllerTests(unittest.TestCase):
     def setUp(self):
         controller.stop = False
         self.raw = json.loads((ROOT / 'config/quanta-fan-control.base.json').read_text())
+        self.raw['cpu_package_control'] = False  # retain coverage of the legacy global path
         self.config = controller.validate_config(self.raw)
         self.fans = set(self.config['required_fans'])
         self.temps = {'CPU0 Temp', 'CPU1 Temp', 'PCH Temp', 'Ambient_Temp',
